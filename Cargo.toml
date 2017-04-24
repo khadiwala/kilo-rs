@@ -6,3 +6,4 @@ authors = ["Ravi Khadiwala <ravi.khadiwala@gmail.com>"]
 [dependencies]
 termios = "0.2"
 libc = "0.2"
+ioctl-rs = "0.1"
