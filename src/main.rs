@@ -7,12 +7,21 @@ use libc::c_ushort;
 
 use termios::*;
 
+const VERSION: &'static str = "0.0.1";
+const CLEAR: &'static [u8] = b"\x1b[2J";
+const CLEAR_LINE: &'static [u8] = b"\x1b[K";
+const SET_CURSOR: &'static [u8] = b"\x1b[H";
+const DISABLE_CURSOR: &'static [u8] = b"\x1b[?25l";
+const ENABLE_CURSOR: &'static [u8] = b"\x1b[?25h";
+
 struct RawTerm(Termios);
 
 struct Term {
     term: RawTerm,
     screenrows: u16,
     screencols: u16,
+    cx: u16,
+    cy: u16,
 }
 
 
@@ -76,24 +85,33 @@ impl Term {
             term: rt,
             screenrows: rows,
             screencols: cols,
+            cx: 0,
+            cy: 0,
         })
+    }
+
+    fn move_cursor(&mut self, key: char) {
+        match key {
+            'a' => self.cx = if self.cx == 0 { 0 } else { self.cx - 1 },
+            'd' => self.cx += 1,
+            'w' => self.cy = if self.cy == 0 { 0 } else { self.cy - 1 },
+            's' => self.cy += 1,
+            _ => (),
+        }
     }
 }
 
 impl Drop for RawTerm {
     fn drop(&mut self) {
         println!("restoring terminal");
-        clear_term().unwrap();
+        execute(CLEAR).unwrap();
+        execute(SET_CURSOR).unwrap();
         tcsetattr(libc::STDIN_FILENO, TCSANOW, &self.0).unwrap();
     }
 }
 
 fn ctrled(c: char) -> u8 {
     (c as u8) & 0x1f
-}
-
-fn iscntrl(c: char) -> bool {
-    unsafe { libc::iscntrl(c as i32) != 0 }
 }
 
 fn editor_read_key(handle: &mut Read) -> char {
@@ -107,45 +125,60 @@ fn editor_read_key(handle: &mut Read) -> char {
     }
 }
 
-fn editor_process_keypress(handle: &mut Read) -> bool {
+fn editor_process_keypress(term: &mut Term) -> bool {
+    let handle = &mut io::stdin();
     let c = editor_read_key(handle);
-    // if iscntrl(c) {
-    //     print!("{}\r\n", c as u8);
-    // } else {
-    //     print!("{}({})\r\n", c, c as u8);
-    // }
+    match c {
+        'a' | 'd' | 'w' | 's' => term.move_cursor(c),
+        _ => (),
+    }
     c as u8 != ctrled('q')
 }
 
-fn editor_draw_rows(term: &Term) -> io::Result<()> {
-    for _ in 0..term.screenrows - 1 {
-        io::stdout().write_all(b"~\r\n")?;
+fn editor_draw_rows(term: &Term) -> Vec<u8> {
+    let mut v = Vec::new();
+    for y in 0..term.screenrows - 1 {
+        v.extend(CLEAR_LINE);
+        if y == term.screenrows / 3 {
+            let welcome = format!("Kilo editor -- version {}\r\n", VERSION);
+            let msglen = std::cmp::min(welcome.len(), term.screencols as usize);
+            let padding = ((term.screencols as usize) - msglen) / 2;
+            for i in 0..padding {
+                v.push(if i == 0 { b'~' } else { b' ' });
+            }
+            v.extend(&welcome.as_bytes()[0..msglen]);
+        } else {
+            v.extend(b"~\r\n");
+        }
     }
-    io::stdout().write_all(b"~")?;
-    Ok(())
+    v.extend(CLEAR_LINE);
+    v.extend(b"~");
+    v
 }
 fn editor_refresh_screen(term: &Term) -> io::Result<()> {
-    clear_term()?;
-    editor_draw_rows(term)?;
-    set_cursor()?;
+    let mut v = Vec::new();
+    v.extend(DISABLE_CURSOR);
+    v.extend(SET_CURSOR);
+    v.extend(editor_draw_rows(term));
+    v.extend(to_pos(term.cx, term.cy));
+    v.extend(ENABLE_CURSOR);
+    execute(&v)
+}
+
+fn to_pos(x: u16, y: u16) -> Vec<u8> {
+    let cmd = format!("\x1b[{};{}H", y + 1, x + 1);
+    cmd.into_bytes()
+}
+
+fn execute(v: &[u8]) -> io::Result<()> {
+    io::stdout().write_all(v)?;
     io::stdout().flush()
 }
 
 // terminal commands
-fn set_cursor() -> io::Result<()> {
-    io::stdout().write_all(b"\x1b[H")?;
-    io::stdout().flush()
-}
-
-fn clear_term() -> io::Result<()> {
-    io::stdout().write_all(b"\x1b[2J")?;
-    set_cursor()?;
-    io::stdout().flush()
-}
 
 fn get_cursor_position() -> io::Result<(u16, u16)> {
-    io::stdout().write_all(b"\x1b[6n")?;
-    io::stdout().flush()?;
+    execute(b"\x1b[6n")?;
 
     let mut vec = Vec::new();
 
@@ -171,10 +204,10 @@ fn get_cursor_position() -> io::Result<(u16, u16)> {
 
 fn main() {
     let rawterm = RawTerm::from(libc::STDIN_FILENO).unwrap();
-    let term = Term::from(rawterm).unwrap();
+    let mut term = Term::from(rawterm).unwrap();
     loop {
         editor_refresh_screen(&term).unwrap();
-        if !editor_process_keypress(&mut io::stdin()) {
+        if !editor_process_keypress(&mut term) {
             break;
         }
     }
