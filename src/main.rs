@@ -14,9 +14,31 @@ const SET_CURSOR: &'static [u8] = b"\x1b[H";
 const DISABLE_CURSOR: &'static [u8] = b"\x1b[?25l";
 const ENABLE_CURSOR: &'static [u8] = b"\x1b[?25h";
 
+#[derive(PartialEq, Eq, Clone, Copy)]
+enum Arrow {
+    Left,
+    Right,
+    Up,
+    Down,
+}
+
+#[derive(PartialEq, Eq)]
+enum Special {
+    Del,
+    Home,
+    End,
+    Page(Arrow),
+}
+
+enum Keypress {
+    Ar(Arrow),
+    Ch(char),
+    Sp(Special),
+}
+
 struct RawTerm(Termios);
 
-struct Term {
+struct Editor {
     term: RawTerm,
     screenrows: u16,
     screencols: u16,
@@ -35,7 +57,6 @@ struct Winsize {
 }
 
 fn ioctl_window_size() -> io::Result<(u16, u16)> {
-    //Err(io::Error::new(io::ErrorKind::Other, "oh no!"))
     let mut w: Winsize = Default::default();
     match unsafe { libc::ioctl(libc::STDIN_FILENO, libc::TIOCGWINSZ, &mut w) } {
             0 => Ok((w.ws_row, w.ws_col)),
@@ -66,7 +87,7 @@ impl RawTerm {
     }
 
     fn enable_raw(&self) -> io::Result<()> {
-        let mut raw = self.0.clone();
+        let mut raw = self.0;
         raw.c_cflag |= CS8;
         raw.c_iflag &= !(BRKINT | INPCK | ISTRIP | IXON | ICRNL);
         raw.c_oflag &= !(OPOST);
@@ -78,10 +99,10 @@ impl RawTerm {
     }
 }
 
-impl Term {
-    fn from(rt: RawTerm) -> io::Result<Term> {
+impl Editor {
+    fn from(rt: RawTerm) -> io::Result<Editor> {
         let (rows, cols) = get_window_size()?;
-        Ok(Term {
+        Ok(Editor {
             term: rt,
             screenrows: rows,
             screencols: cols,
@@ -90,14 +111,77 @@ impl Term {
         })
     }
 
-    fn move_cursor(&mut self, key: char) {
+    fn move_cursor(&mut self, key: Arrow) {
         match key {
-            'a' => self.cx = if self.cx == 0 { 0 } else { self.cx - 1 },
-            'd' => self.cx += 1,
-            'w' => self.cy = if self.cy == 0 { 0 } else { self.cy - 1 },
-            's' => self.cy += 1,
-            _ => (),
+            Arrow::Left => self.cx = if self.cx == 0 { 0 } else { self.cx - 1 },
+            Arrow::Right => {
+                if self.cx != self.screenrows - 1 {
+                    self.cx += 1
+                }
+            }
+            Arrow::Up => self.cy = if self.cy == 0 { 0 } else { self.cy - 1 },
+            Arrow::Down => {
+                if self.cy != self.screencols - 1 {
+                    self.cy += 1
+                }
+            }
         }
+    }
+
+    fn process_keypress(&mut self) -> bool {
+        let handle = &mut io::stdin();
+        let kp = editor_read_key(handle);
+        match kp {
+            Keypress::Ar(arrow) => {
+                self.move_cursor(arrow);
+                true
+            }
+            Keypress::Ch(c) => c as u8 != ctrled('q'),
+            Keypress::Sp(special) => {
+                match special {
+                    Special::Page(dir) => {
+                        for _ in 0..self.screenrows {
+                            self.move_cursor(dir);
+                        }
+                    }
+                    Special::Home => self.cx = 0,
+                    Special::End => self.cx = self.screencols,
+                    _ => (),
+                };
+                true
+            }
+        }
+    }
+
+    fn refresh_screen(&mut self) -> io::Result<()> {
+        let mut v = Vec::new();
+        v.extend(DISABLE_CURSOR);
+        v.extend(SET_CURSOR);
+        v.extend(self.draw_rows());
+        v.extend(to_pos(self.cx, self.cy));
+        v.extend(ENABLE_CURSOR);
+        execute(&v)
+    }
+
+    fn draw_rows(&mut self) -> Vec<u8> {
+        let mut v = Vec::new();
+        for y in 0..self.screenrows - 1 {
+            v.extend(CLEAR_LINE);
+            if y == self.screenrows / 3 {
+                let welcome = format!("Kilo editor -- version {}\r\n", VERSION);
+                let msglen = std::cmp::min(welcome.len(), self.screencols as usize);
+                let padding = ((self.screencols as usize) - msglen) / 2;
+                for i in 0..padding {
+                    v.push(if i == 0 { b'~' } else { b' ' });
+                }
+                v.extend(&welcome.as_bytes()[0..msglen]);
+            } else {
+                v.extend(b"~\r\n");
+            }
+        }
+        v.extend(CLEAR_LINE);
+        v.extend(b"~");
+        v
     }
 }
 
@@ -114,56 +198,56 @@ fn ctrled(c: char) -> u8 {
     (c as u8) & 0x1f
 }
 
-fn editor_read_key(handle: &mut Read) -> char {
+fn read1(handle: &mut Read) -> Option<u8> {
     let mut buffer: [u8; 1] = [0];
+    match handle.take(1).read(&mut buffer) {
+        Ok(1) => Some(buffer[0]),
+        Ok(0) => None,
+        Ok(_) | Err(_) => panic!("error"),
+    }
+}
+
+fn editor_read_key(handle: &mut Read) -> Keypress {
+    let c;
     loop {
-        match handle.take(1).read(&mut buffer) {
-            Ok(1) => return buffer[0] as char,
-            Ok(0) => continue,
-            Ok(_) | Err(_) => panic!("error"),
-        };
-    }
-}
-
-fn editor_process_keypress(term: &mut Term) -> bool {
-    let handle = &mut io::stdin();
-    let c = editor_read_key(handle);
-    match c {
-        'a' | 'd' | 'w' | 's' => term.move_cursor(c),
-        _ => (),
-    }
-    c as u8 != ctrled('q')
-}
-
-fn editor_draw_rows(term: &Term) -> Vec<u8> {
-    let mut v = Vec::new();
-    for y in 0..term.screenrows - 1 {
-        v.extend(CLEAR_LINE);
-        if y == term.screenrows / 3 {
-            let welcome = format!("Kilo editor -- version {}\r\n", VERSION);
-            let msglen = std::cmp::min(welcome.len(), term.screencols as usize);
-            let padding = ((term.screencols as usize) - msglen) / 2;
-            for i in 0..padding {
-                v.push(if i == 0 { b'~' } else { b' ' });
+        match read1(handle) {
+            Some(x) => {
+                c = x;
+                break;
             }
-            v.extend(&welcome.as_bytes()[0..msglen]);
-        } else {
-            v.extend(b"~\r\n");
+            None => continue,
         }
     }
-    v.extend(CLEAR_LINE);
-    v.extend(b"~");
-    v
+    if c == b'\x1b' {
+        if let (Some(c1), Some(c2)) = (read1(handle), read1(handle)) {
+            match (c1, c2) {
+                (b'[', b'0'...b'9') => {
+                    if let Some(c3) = read1(handle) {
+                        match (c3, c2) {
+                            (b'~', b'1') | (b'~', b'7') => return Keypress::Sp(Special::Home),
+                            (b'~', b'4') | (b'~', b'8') => return Keypress::Sp(Special::End),
+                            (b'~', b'3') => return Keypress::Sp(Special::Del),
+                            (b'~', b'5') => return Keypress::Sp(Special::Page(Arrow::Up)),
+                            (b'~', b'6') => return Keypress::Sp(Special::Page(Arrow::Down)),
+                            (_, _) => (),
+                        }
+                    }
+                }
+                (b'[', b'A') => return Keypress::Ar(Arrow::Up),
+                (b'[', b'B') => return Keypress::Ar(Arrow::Down),
+                (b'[', b'C') => return Keypress::Ar(Arrow::Right),
+                (b'[', b'D') => return Keypress::Ar(Arrow::Left),
+                (b'[', b'H') | (b'O', b'H') => return Keypress::Sp(Special::Home),
+                (b'[', b'F') | (b'O', b'F') => return Keypress::Sp(Special::End),
+                _ => (),
+            }
+        }
+    }
+    Keypress::Ch(c as char)
+
 }
-fn editor_refresh_screen(term: &Term) -> io::Result<()> {
-    let mut v = Vec::new();
-    v.extend(DISABLE_CURSOR);
-    v.extend(SET_CURSOR);
-    v.extend(editor_draw_rows(term));
-    v.extend(to_pos(term.cx, term.cy));
-    v.extend(ENABLE_CURSOR);
-    execute(&v)
-}
+
+// terminal commands
 
 fn to_pos(x: u16, y: u16) -> Vec<u8> {
     let cmd = format!("\x1b[{};{}H", y + 1, x + 1);
@@ -174,8 +258,6 @@ fn execute(v: &[u8]) -> io::Result<()> {
     io::stdout().write_all(v)?;
     io::stdout().flush()
 }
-
-// terminal commands
 
 fn get_cursor_position() -> io::Result<(u16, u16)> {
     execute(b"\x1b[6n")?;
@@ -204,10 +286,10 @@ fn get_cursor_position() -> io::Result<(u16, u16)> {
 
 fn main() {
     let rawterm = RawTerm::from(libc::STDIN_FILENO).unwrap();
-    let mut term = Term::from(rawterm).unwrap();
+    let mut editor = Editor::from(rawterm).unwrap();
     loop {
-        editor_refresh_screen(&term).unwrap();
-        if !editor_process_keypress(&mut term) {
+        editor.refresh_screen().unwrap();
+        if !editor.process_keypress() {
             break;
         }
     }
