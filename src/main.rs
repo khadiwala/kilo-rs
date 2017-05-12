@@ -24,6 +24,12 @@ const SET_CURSOR: &'static [u8] = b"\x1b[H";
 const DISABLE_CURSOR: &'static [u8] = b"\x1b[?25l";
 const ENABLE_CURSOR: &'static [u8] = b"\x1b[?25h";
 
+const SAVE: u8 = (b's' & 0x1f);
+const QUIT: u8 = (b'q' & 0x1f);
+const CTRLH: u8 = (b'h' & 0x1f);
+
+const QUIT_TIMES: u8 = 3;
+
 #[derive(PartialEq, Eq, Clone, Copy)]
 enum Arrow {
     Left,
@@ -34,9 +40,14 @@ enum Arrow {
 
 #[derive(PartialEq, Eq)]
 enum Special {
-    Del,
     Home,
     End,
+    Enter,
+    Backspace,
+    CtrlH,
+    Del,
+    Save,
+    Quit,
     Page(Arrow),
 }
 
@@ -47,23 +58,25 @@ enum Keypress {
 }
 
 struct RawTerm(Termios);
+impl RawTerm {
+    fn from(fd: RawFd) -> io::Result<RawTerm> {
+        let term = RawTerm(Termios::from_fd(fd)?);
+        term.enable_raw()?;
+        Ok(term)
+    }
 
-struct Editor {
-    term: RawTerm,
-    screenrows: usize,
-    screencols: usize,
-    cx: usize,
-    cy: usize,
-    rx: usize,
-    rows: Vec<String>,
-    render: Vec<String>,
-    rowoff: usize,
-    coloff: usize,
-    filename: String,
-    status_msg: String,
-    status_time: Timespec,
+    fn enable_raw(&self) -> io::Result<()> {
+        let mut raw = self.0;
+        raw.c_cflag |= CS8;
+        raw.c_iflag &= !(BRKINT | INPCK | ISTRIP | IXON | ICRNL);
+        raw.c_oflag &= !(OPOST);
+        raw.c_lflag &= !(ECHO | ICANON | ISIG | IEXTEN);
+
+        raw.c_cc[VMIN] = 0;
+        raw.c_cc[VTIME] = 1;
+        tcsetattr(libc::STDIN_FILENO, TCSANOW, &raw)
+    }
 }
-
 
 #[repr(C)]
 #[derive(Default)]
@@ -97,25 +110,94 @@ fn get_window_size() -> io::Result<(u16, u16)> {
     ioctl_window_size().or_else(|_| tty_window_size())
 }
 
-impl RawTerm {
-    fn from(fd: RawFd) -> io::Result<RawTerm> {
-        let term = RawTerm(Termios::from_fd(fd)?);
-        term.enable_raw()?;
-        Ok(term)
+struct Row {
+    orig: String,
+    rendered: String,
+    len: usize,
+}
+
+impl Row {
+    fn from(line: String) -> Row {
+        let rendered = Row::render(&line);
+        let len = line.len();
+        Row {
+            rendered: rendered,
+            orig: line,
+            len: len,
+        }
     }
 
-    fn enable_raw(&self) -> io::Result<()> {
-        let mut raw = self.0;
-        raw.c_cflag |= CS8;
-        raw.c_iflag &= !(BRKINT | INPCK | ISTRIP | IXON | ICRNL);
-        raw.c_oflag &= !(OPOST);
-        raw.c_lflag &= !(ECHO | ICANON | ISIG | IEXTEN);
+    fn insert_char(&mut self, at: usize, c: char) {
+        self.orig.insert(min(at, self.len), c);
+        self.len += 1;
+        self.rendered = Row::render(&self.orig);
+    }
 
-        raw.c_cc[VMIN] = 0;
-        raw.c_cc[VTIME] = 1;
-        tcsetattr(libc::STDIN_FILENO, TCSANOW, &raw)
+    fn delete_char(&mut self, at: usize) {
+        self.orig.remove(at);
+        self.len -= 1;
+        self.rendered = Row::render(&self.orig);
+    }
+
+    fn push(&mut self, r: &Row) {
+        self.orig.push_str(&r.orig);
+        self.len += r.len;
+        self.rendered = Row::render(&self.orig);
+    }
+
+    fn split_off(&mut self, at: usize) -> Row {
+        let right = self.orig.split_off(at);
+        self.len = at;
+        self.rendered = Row::render(&self.orig);
+        Row::from(right)
+    }
+
+    fn render(line: &str) -> String {
+        // count tabs so we only need to make a single allocation
+        let tabs = line.as_bytes().iter().filter(|c| **c == b'\t').count();
+        let mut rendered: Vec<u8> = Vec::with_capacity(line.len() + tabs * (TABSTOP - 1));
+        let mut r_index = 0;
+        for c in line.as_bytes() {
+            if *c == b'\t' {
+                rendered.push(b' ');
+                r_index += 1;
+                while r_index % TABSTOP != 0 {
+                    rendered.push(b' ');
+                    r_index += 1;
+                }
+            } else {
+                rendered.push(*c);
+                r_index += 1;
+            }
+        }
+        std::string::String::from_utf8(rendered).unwrap()
     }
 }
+
+
+struct Editor {
+    term: RawTerm,
+    screenrows: usize,
+    screencols: usize,
+
+    // current x position
+    cx: usize,
+    // current y position
+    cy: usize,
+    // current x position in rendered row
+    rx: usize,
+
+    rows: Vec<Row>,
+    rowoff: usize,
+    coloff: usize,
+
+    filename: String,
+    dirty: usize,
+    quit_times: u8,
+    status_msg: String,
+    status_time: Timespec,
+}
+
 
 impl Editor {
     fn from(rt: RawTerm) -> io::Result<Editor> {
@@ -125,19 +207,15 @@ impl Editor {
                // leave two rows for status
                screenrows: (rows - 2) as usize,
                screencols: cols as usize,
-               // current column
                cx: 0,
-               // current row
                cy: 0,
-               // current column within rendered line
                rx: 0,
-               // file contents
                rows: Vec::new(),
-               // rendered contents (tabs->spaces)
-               render: Vec::new(),
                rowoff: 0,
                coloff: 0,
-               filename: "[No name]".to_owned(),
+               filename: String::new(),
+               dirty: 0,
+               quit_times: QUIT_TIMES,
                status_msg: "".to_owned(),
                status_time: Timespec::new(0, 0),
            })
@@ -149,29 +227,80 @@ impl Editor {
         let handle = BufReader::new(f);
         for rline in handle.lines() {
             let line = rline?;
-            // count tabs so we only need to make a single allocation
-            let tabs = line.as_bytes().iter().filter(|c| **c == b'\t').count();
-            let mut rendered: Vec<u8> = Vec::with_capacity(line.len() + tabs * (TABSTOP - 1));
-            let mut r_index = 0;
-            for c in line.as_bytes() {
-                if *c == b'\t' {
-                    rendered.push(b' ');
-                    r_index += 1;
-                    while r_index % TABSTOP != 0 {
-                        rendered.push(b' ');
-                        r_index += 1;
-                    }
-                } else {
-                    rendered.push(*c);
-                    r_index += 1;
-                }
-            }
-            let render_s = std::string::String::from_utf8(rendered)
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-            self.render.push(render_s);
-            self.rows.push(line);
+            self.rows.push(Row::from(line));
         }
         Ok(())
+    }
+
+    fn rows_to_file(&self) -> String {
+        self.rows
+            .iter()
+            .map(|row| &row.orig)
+            .fold(String::new(), |mut s, nxt| {
+                s.push_str(nxt);
+                s.push('\n');
+                s
+            })
+    }
+
+    fn save(&mut self) -> io::Result<usize> {
+        if self.filename == "" {
+            self.filename = self.prompt("Save as: {} (ESC to cancel)")?;
+            if self.filename == "" {
+                return Ok(0);
+            }
+        }
+        let file_content = self.rows_to_file();
+        let len = file_content.len();
+        let handle = File::create(&self.filename);
+        handle?.write_all(file_content.as_bytes())?;
+
+        // only clear dirty if save worked
+        self.dirty = 0;
+        Ok(len)
+    }
+
+    fn insert_char(&mut self, c: char) {
+        if self.cy == self.rows.len() {
+            self.rows.push(Row::from(String::new()))
+        }
+        self.rows[self.cy].insert_char(self.cx, c);
+        self.cx += 1;
+        self.dirty += 1;
+    }
+
+    fn insert_newline(&mut self) {
+        if self.cy > self.rows.len() {
+            return;
+        }
+        if self.cx == 0 {
+            self.rows.insert(self.cy, Row::from(String::new()));
+        } else {
+            let next = self.rows[self.cy].split_off(self.cx);
+            self.rows.insert(self.cy + 1, next);
+        }
+        self.cx = 0;
+        self.cy += 1;
+        self.dirty += 1;
+    }
+
+    fn delete_char(&mut self) {
+        if self.cy == self.rows.len() || (self.cx == 0 && self.cy == 0) {
+            return; 
+        }
+        if self.cx > 0 {
+            let row = &mut self.rows[self.cy];
+            row.delete_char(self.cx - 1);
+            self.cx -= 1;
+        } else {
+            let row = self.rows.remove(self.cy);
+            let prev = &mut self.rows[self.cy - 1];
+            self.cx = prev.len;
+            prev.push(&row);
+            self.cy -= 1;
+
+        }
+        self.dirty +=1;
     }
 
     fn move_cursor(&mut self, key: Arrow) {
@@ -181,11 +310,11 @@ impl Editor {
                     self.cx -= 1;
                 } else if self.cy > 0 {
                     self.cy -= 1;
-                    self.cx = self.rows[self.cy].len();
+                    self.cx = self.rows[self.cy].len;
                 }
             }
             Arrow::Right => {
-                let rowlen = self.rows.get(self.cy).map_or(0, String::len);
+                let rowlen = self.rows.get(self.cy).map_or(0, |r| r.len);
                 if self.cx < rowlen {
                     self.cx += 1;
                 } else if self.cx == rowlen {
@@ -202,7 +331,7 @@ impl Editor {
         }
 
         // limit cursor to end of line
-        let rowlen = self.rows.get(self.cy).map_or(0, String::len);
+        let rowlen = self.rows.get(self.cy).map_or(0, |r| r.len);
         if self.cx > rowlen {
             self.cx = rowlen;
         }
@@ -217,7 +346,7 @@ impl Editor {
         self.rx = if self.cy < self.rows.len() {
             let row = &self.rows[self.cy];
             let xpos = self.cx;
-            cx_to_rx(row.as_bytes(), xpos)
+            cx_to_rx(row.orig.as_bytes(), xpos)
         } else {
             0
         };
@@ -242,35 +371,83 @@ impl Editor {
         let handle = &mut io::stdin();
         let kp = editor_read_key(handle);
         match kp {
-            Keypress::Ar(arrow) => {
-                self.move_cursor(arrow);
-                true
-            }
-            Keypress::Ch(c) => c as u8 != ctrled('q'),
-            Keypress::Sp(special) => {
-                match special {
-                    Special::Page(dir) => {
-                        match dir {
-                            Arrow::Up => self.cy = self.rowoff,
-                            Arrow::Down => {
-                                self.cy = min(self.rowoff + self.screenrows - 1, self.rows.len())
-                            }
-                            _ => panic!("illegal paging"),
-                        }
-                        for _ in 0..self.screenrows {
-                            self.move_cursor(dir);
-                        }
-                    }
-                    Special::Home => self.cx = 0,
-                    Special::End => {
-                        if self.cy < self.rows.len() {
-                            self.cx = self.rows[self.cy].len();
-                        }
-                    }
-                    _ => (),
+            Keypress::Sp(Special::Quit) => {
+                if self.dirty > 0 && self.quit_times > 0 {
+                    let quits_left = self.quit_times;
+                    self.set_status_message(format!("WARNING!!! File has unsaved changes. Press Ctrl-Q {} more times to quit.", quits_left));
+                    self.quit_times -= 1;
+                    return true;
+                }
+                return false;
+            },
+            Keypress::Sp(Special::Save) => {
+                match self.save() {
+                    Ok(len) => self.set_status_message(format!("{} bytes written to disk", len)),
+                    Err(e) => self.set_status_message(format!("Can't save! I/O error: {}", e)),
                 };
-                true
+            },
+            Keypress::Sp(Special::Page(dir)) => {
+                match dir {
+                    Arrow::Up => self.cy = self.rowoff,
+                    Arrow::Down => {
+                        self.cy = min(self.rowoff + self.screenrows - 1, self.rows.len())
+                    }
+                    _ => panic!("illegal paging"),
+                }
+                for _ in 0..self.screenrows {
+                    self.move_cursor(dir);
+                }
+            },
+            Keypress::Sp(Special::Home) => self.cx = 0,
+            Keypress::Sp(Special::End) => {
+                if self.cy < self.rows.len() {
+                    self.cx = self.rows[self.cy].len;
+                }
             }
+            Keypress::Sp(Special::Enter) => self.insert_newline(),
+            Keypress::Sp(Special::Backspace)  | Keypress::Sp(Special::CtrlH) => self.delete_char(),
+            Keypress::Sp(Special::Del) => {
+                self.move_cursor(Arrow::Right);
+                self.delete_char();
+            }
+            Keypress::Ar(arrow) => self.move_cursor(arrow),
+            Keypress::Ch(c) => self.insert_char(c),
+        };
+        self.quit_times = QUIT_TIMES;
+        true
+    }
+
+    fn prompt(&mut self, prompt: &str) -> io::Result<String> {
+        let handle = &mut io::stdin();
+        let mut input = String::with_capacity(128);
+        loop {
+            self.set_status_message(prompt.replace("{}", &input));
+            self.refresh_screen()?;
+
+            let keypress = editor_read_key(handle);
+            match keypress {
+                Keypress::Sp(Special::Backspace) | Keypress::Sp(Special::Del) | Keypress::Sp(Special::CtrlH) => {
+                    let input_len = input.len();
+                    if input_len > 0 {
+                        input.remove(input_len - 1);
+                    }
+                }
+                Keypress::Sp(Special::Enter) => {
+                    if !input.is_empty() {
+                        self.set_status_message("".to_string());
+                        return Ok(input);
+                    }
+                },
+                Keypress::Ch('\x1b') => {
+                    self.set_status_message("".to_string());
+                    return Ok(String::new());
+                },
+                Keypress::Ch(c) => {
+                    input.push(c);
+                }
+                _ => (),
+            }
+
         }
     }
 
@@ -287,12 +464,14 @@ impl Editor {
         execute(&v)
     }
 
-    fn draw_status_bar(&mut self) -> Vec<u8> {
+    fn draw_status_bar(&self) -> Vec<u8> {
+        let display_name = if self.filename.is_empty() {"[No name]"} else {&self.filename};
         let mut v: Vec<u8> = Vec::new();
         v.extend(b"\x1b[7m");
-        let lstatus = format!("{} - {} lines",
-                              &self.filename[..min(self.filename.len(), 20)],
-                              self.rows.len());
+        let lstatus = format!("{} - {} lines {}",
+                              &display_name[..min(display_name.len(), 20)],
+                              self.rows.len(),
+                              if self.dirty != 0 { "(modified)" } else { "" });
         let rstatus = format!("{}/{}", self.cy + 1, self.rows.len());
         let truncated = &lstatus[0..min(lstatus.len(), (self.screencols - rstatus.len()))];
         v.extend(truncated.as_bytes());
@@ -312,7 +491,7 @@ impl Editor {
         v
     }
 
-    fn draw_rows(&mut self) -> Vec<u8> {
+    fn draw_rows(&self) -> Vec<u8> {
         let mut v = Vec::new();
         for y in 0..self.screenrows {
             v.extend(CLEAR_LINE);
@@ -330,11 +509,11 @@ impl Editor {
                     v.extend(b"~\r\n");
                 }
             } else {
-                let line = &self.render[filerow];
+                let line = &self.rows[filerow].rendered;
                 let available_text = max(line.len() as i32 - self.coloff as i32, 0);
                 let len = min(available_text, self.screencols as i32) as usize;
                 let start = if len > 0 { self.coloff } else { 0 };
-                v.extend(self.render[filerow][start..start + len].as_bytes());
+                v.extend(line[start..start + len].as_bytes());
                 v.extend(b"\r\n")
             }
         }
@@ -351,10 +530,6 @@ impl Drop for RawTerm {
         execute(SET_CURSOR).unwrap();
         tcsetattr(libc::STDIN_FILENO, TCSANOW, &self.0).unwrap();
     }
-}
-
-fn ctrled(c: char) -> u8 {
-    (c as u8) & 0x1f
 }
 
 fn read1(handle: &mut Read) -> Option<u8> {
@@ -402,7 +577,14 @@ fn editor_read_key(handle: &mut Read) -> Keypress {
             }
         }
     }
-    Keypress::Ch(c as char)
+    match c {
+        127 => Keypress::Sp(Special::Backspace),
+        b'\r' => Keypress::Sp(Special::Enter),
+        CTRLH => Keypress::Sp(Special::CtrlH),
+        QUIT => Keypress::Sp(Special::Quit),
+        SAVE => Keypress::Sp(Special::Save),
+        _ => Keypress::Ch(c as char)
+    }
 }
 
 // terminal commands
@@ -460,7 +642,7 @@ fn main() {
     args()
         .nth(1)
         .map(|filename| editor.open(&filename).unwrap());
-    editor.set_status_message("HELP: Ctrl-Q = quit".to_owned());
+    editor.set_status_message("HELP: Ctrl-S = save | Ctrl-Q = quit".to_owned());
     loop {
         editor.refresh_screen().unwrap();
         if !editor.process_keypress() {
