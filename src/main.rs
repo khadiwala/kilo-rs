@@ -15,20 +15,27 @@ use libc::c_ushort;
 use time::{get_time, Timespec};
 use termios::*;
 
+// editor config
 const VERSION: &'static str = "0.0.1";
 const TABSTOP: usize = 8;
+const QUIT_TIMES: u8 = 3;
 
+// ANSI codes
 const CLEAR: &'static [u8] = b"\x1b[2J";
 const CLEAR_LINE: &'static [u8] = b"\x1b[K";
 const SET_CURSOR: &'static [u8] = b"\x1b[H";
 const DISABLE_CURSOR: &'static [u8] = b"\x1b[?25l";
 const ENABLE_CURSOR: &'static [u8] = b"\x1b[?25h";
+const INVERTED_COLOR: &'static [u8] = b"\x1b[7m";
+const NORMAL_COLOR: &'static [u8] = b"\x1b[m";
+const GET_CURSOR_POS: &'static [u8] = b"\x1b[6n";
 
+// ctrl-key sequences
 const SAVE: u8 = (b's' & 0x1f);
 const QUIT: u8 = (b'q' & 0x1f);
+const FIND: u8 = (b'f' & 0x1f);
 const CTRLH: u8 = (b'h' & 0x1f);
 
-const QUIT_TIMES: u8 = 3;
 
 #[derive(PartialEq, Eq, Clone, Copy)]
 enum Arrow {
@@ -37,9 +44,9 @@ enum Arrow {
     Up,
     Down,
 }
-
-#[derive(PartialEq, Eq)]
-enum Special {
+enum Keypress {
+    Ar(Arrow),
+    Page(Arrow),
     Home,
     End,
     Enter,
@@ -47,14 +54,10 @@ enum Special {
     CtrlH,
     Del,
     Save,
+    Find,
     Quit,
-    Page(Arrow),
-}
-
-enum Keypress {
-    Ar(Arrow),
+    Esc,
     Ch(char),
-    Sp(Special),
 }
 
 struct RawTerm(Termios);
@@ -81,10 +84,14 @@ impl RawTerm {
 #[repr(C)]
 #[derive(Default)]
 struct Winsize {
-    ws_row: c_ushort, /* rows, in characters */
-    ws_col: c_ushort, /* columns, in characters */
-    ws_xpixel: c_ushort, /* horizontal size, pixels */
-    ws_ypixel: c_ushort, /* vertical size, pixels */
+    // rows, in characters
+    ws_row: c_ushort,
+    // columns, in characters
+    ws_col: c_ushort,
+    // horizontal size, pixels
+    ws_xpixel: c_ushort,
+    // vertical size, pixels
+    ws_ypixel: c_ushort,
 }
 
 fn ioctl_window_size() -> io::Result<(u16, u16)> {
@@ -152,6 +159,32 @@ impl Row {
         Row::from(right)
     }
 
+    fn cx_to_rx(&self, cx: usize) -> usize {
+        let row = self.orig.as_bytes();
+        let mut rx = 0;
+        for &c in row[0..cx].iter() {
+            if c == b'\t' {
+                rx += (TABSTOP - 1) - (rx % TABSTOP)
+            }
+            rx += 1;
+        }
+        rx
+    }
+    fn rx_to_cx(&self, rx: usize) -> usize {
+        let row = self.orig.as_bytes();
+        let mut cur_rx = 0;
+        for (i, &c) in row.iter().enumerate() {
+            if c == b'\t' {
+                cur_rx += (TABSTOP - 1) - (rx % TABSTOP);
+            }
+            cur_rx += 1;
+            if cur_rx > rx {
+                return i;
+            }
+        }
+        row.len() - 1
+    }
+
     fn render(line: &str) -> String {
         // count tabs so we only need to make a single allocation
         let tabs = line.as_bytes().iter().filter(|c| **c == b'\t').count();
@@ -174,28 +207,94 @@ impl Row {
     }
 }
 
+#[derive(Clone, Copy, Default)]
+struct Position {
+    // current x position
+    cx: usize,
+    // current y position
+    cy: usize,
+    rowoff: usize,
+    coloff: usize,
+}
 
 struct Editor {
     term: RawTerm,
     screenrows: usize,
     screencols: usize,
+    position: Position,
 
-    // current x position
-    cx: usize,
-    // current y position
-    cy: usize,
     // current x position in rendered row
     rx: usize,
 
     rows: Vec<Row>,
-    rowoff: usize,
-    coloff: usize,
-
     filename: String,
     dirty: usize,
     quit_times: u8,
     status_msg: String,
     status_time: Timespec,
+}
+
+trait PromptCallback {
+    fn callback(&mut self, &mut Editor, &str, Keypress);
+}
+
+struct EmptyCallback();
+impl PromptCallback for EmptyCallback {
+    fn callback(&mut self, _: &mut Editor, _: &str, _: Keypress) {}
+}
+
+struct FindPromptCallback {
+    direction: i32,
+    last_match: i32,
+}
+
+impl PromptCallback for FindPromptCallback {
+    fn callback(&mut self, editor: &mut Editor, partial_input: &str, kp: Keypress) {
+        match kp {
+            Keypress::Enter | Keypress::Esc => return,
+            Keypress::Ar(Arrow::Right) |
+            Keypress::Ar(Arrow::Down) => self.direction = 1,
+            Keypress::Ar(Arrow::Left) |
+            Keypress::Ar(Arrow::Up) => self.direction = -1,
+            _ => {
+                self.direction = 1;
+                self.last_match = -1;
+            }
+        }
+        Some(partial_input)
+            .iter()
+            .find(|q| !q.is_empty())
+            .and_then(|q| {
+                if self.last_match == -1 {
+                    self.direction = 1
+                };
+                let mut current = self.last_match;
+
+                // always make one loop through the file
+                for _ in 0..editor.rows.len() {
+                    current += self.direction;
+                    // loop around when hitting end or beginning
+                    if current == -1 {
+                        current = (editor.rows.len() as i32) - 1;
+                    } else if current == editor.rows.len() as i32 {
+                        current = 0;
+                    }
+                    let row = &editor.rows[current as usize];
+                    let matched = row.rendered.find(q).map(|f| (current as usize, f));
+                    if matched.is_some() {
+                        return matched;
+                    }
+                }
+                None
+            })
+            .map(|(rowidx, colidx)| {
+                let brow = &editor.rows[rowidx];
+                self.last_match = rowidx as i32;
+                editor.position.cy = rowidx;
+                editor.position.cx = brow.rx_to_cx(colidx);
+                editor.position.rowoff = editor.rows.len();
+            });
+    }
 }
 
 
@@ -207,12 +306,9 @@ impl Editor {
                // leave two rows for status
                screenrows: (rows - 2) as usize,
                screencols: cols as usize,
-               cx: 0,
-               cy: 0,
+               position: Default::default(),
                rx: 0,
                rows: Vec::new(),
-               rowoff: 0,
-               coloff: 0,
                filename: String::new(),
                dirty: 0,
                quit_times: QUIT_TIMES,
@@ -245,7 +341,7 @@ impl Editor {
 
     fn save(&mut self) -> io::Result<usize> {
         if self.filename == "" {
-            self.filename = self.prompt("Save as: {} (ESC to cancel)")?;
+            self.filename = self.prompt("Save as: {} (ESC to cancel)", &mut EmptyCallback())?;
             if self.filename == "" {
                 return Ok(0);
             }
@@ -260,80 +356,139 @@ impl Editor {
         Ok(len)
     }
 
+    fn find(&mut self) {
+        let initial = self.position;
+
+        let last = self.prompt("Seach: {} (Use ESC/Arrows/Enter)",
+                               &mut FindPromptCallback {
+                                        direction: 1,
+                                        last_match: -1,
+                                    });
+        last.ok()
+            .iter()
+            .find(|s| !s.is_empty())
+            .map(|_| ())
+            .unwrap_or_else(|| self.position = initial);
+    }
+
+    fn prompt<T>(&mut self, prompt: &str, callback: &mut T) -> io::Result<String>
+        where T: PromptCallback
+    {
+        let handle = &mut io::stdin();
+        let mut input = String::with_capacity(128);
+        loop {
+            self.set_status_message(prompt.replace("{}", &input));
+            self.refresh_screen()?;
+
+            let keypress = editor_read_key(handle);
+            match keypress {
+                Keypress::Backspace | Keypress::Del | Keypress::CtrlH => {
+                    let input_len = input.len();
+                    if input_len > 0 {
+                        input.remove(input_len - 1);
+                    }
+                }
+                Keypress::Enter => {
+                    if !input.is_empty() {
+                        self.set_status_message("".to_string());
+                        callback.callback(self, &input, keypress);
+                        return Ok(input);
+                    }
+                }
+                Keypress::Esc => {
+                    self.set_status_message("".to_string());
+                    callback.callback(self, &input, keypress);
+                    return Ok(String::new());
+                }
+                Keypress::Ch(c) => {
+                    input.push(c);
+                }
+                _ => (),
+            }
+            callback.callback(self, &input, keypress);
+        }
+    }
+
     fn insert_char(&mut self, c: char) {
-        if self.cy == self.rows.len() {
+        if self.position.cy == self.rows.len() {
             self.rows.push(Row::from(String::new()))
         }
-        self.rows[self.cy].insert_char(self.cx, c);
-        self.cx += 1;
+        self.rows[self.position.cy].insert_char(self.position.cx, c);
+        self.position.cx += 1;
         self.dirty += 1;
     }
 
     fn insert_newline(&mut self) {
-        if self.cy > self.rows.len() {
+        if self.position.cy > self.rows.len() {
             return;
         }
-        if self.cx == 0 {
-            self.rows.insert(self.cy, Row::from(String::new()));
+        if self.position.cx == 0 {
+            self.rows.insert(self.position.cy, Row::from(String::new()));
         } else {
-            let next = self.rows[self.cy].split_off(self.cx);
-            self.rows.insert(self.cy + 1, next);
+            let next = self.rows[self.position.cy].split_off(self.position.cx);
+            self.rows.insert(self.position.cy + 1, next);
         }
-        self.cx = 0;
-        self.cy += 1;
+        self.position.cx = 0;
+        self.position.cy += 1;
         self.dirty += 1;
     }
 
     fn delete_char(&mut self) {
-        if self.cy == self.rows.len() || (self.cx == 0 && self.cy == 0) {
-            return; 
+        if self.position.cy == self.rows.len() || (self.position.cx == 0 && self.position.cy == 0) {
+            return;
         }
-        if self.cx > 0 {
-            let row = &mut self.rows[self.cy];
-            row.delete_char(self.cx - 1);
-            self.cx -= 1;
+        if self.position.cx > 0 {
+            let row = &mut self.rows[self.position.cy];
+            row.delete_char(self.position.cx - 1);
+            self.position.cx -= 1;
         } else {
-            let row = self.rows.remove(self.cy);
-            let prev = &mut self.rows[self.cy - 1];
-            self.cx = prev.len;
+            let row = self.rows.remove(self.position.cy);
+            let prev = &mut self.rows[self.position.cy - 1];
+            self.position.cx = prev.len;
             prev.push(&row);
-            self.cy -= 1;
+            self.position.cy -= 1;
 
         }
-        self.dirty +=1;
+        self.dirty += 1;
     }
 
     fn move_cursor(&mut self, key: Arrow) {
         match key {
             Arrow::Left => {
-                if self.cx != 0 {
-                    self.cx -= 1;
-                } else if self.cy > 0 {
-                    self.cy -= 1;
-                    self.cx = self.rows[self.cy].len;
+                if self.position.cx != 0 {
+                    self.position.cx -= 1;
+                } else if self.position.cy > 0 {
+                    self.position.cy -= 1;
+                    self.position.cx = self.rows[self.position.cy].len;
                 }
             }
             Arrow::Right => {
-                let rowlen = self.rows.get(self.cy).map_or(0, |r| r.len);
-                if self.cx < rowlen {
-                    self.cx += 1;
-                } else if self.cx == rowlen {
-                    self.cy += 1;
-                    self.cx = 0;
+                let rowlen = self.rows.get(self.position.cy).map_or(0, |r| r.len);
+                if self.position.cx < rowlen {
+                    self.position.cx += 1;
+                } else if self.position.cx == rowlen {
+                    self.position.cy += 1;
+                    self.position.cx = 0;
                 }
             }
-            Arrow::Up => self.cy = if self.cy == 0 { 0 } else { self.cy - 1 },
+            Arrow::Up => {
+                self.position.cy = if self.position.cy == 0 {
+                    0
+                } else {
+                    self.position.cy - 1
+                }
+            }
             Arrow::Down => {
-                if self.cy < self.rows.len() {
-                    self.cy += 1
+                if self.position.cy < self.rows.len() {
+                    self.position.cy += 1
                 }
             }
         }
 
         // limit cursor to end of line
-        let rowlen = self.rows.get(self.cy).map_or(0, |r| r.len);
-        if self.cx > rowlen {
-            self.cx = rowlen;
+        let rowlen = self.rows.get(self.position.cy).map_or(0, |r| r.len);
+        if self.position.cx > rowlen {
+            self.position.cx = rowlen;
         }
     }
 
@@ -343,27 +498,27 @@ impl Editor {
     }
 
     fn scroll(&mut self) {
-        self.rx = if self.cy < self.rows.len() {
-            let row = &self.rows[self.cy];
-            let xpos = self.cx;
-            cx_to_rx(row.orig.as_bytes(), xpos)
+        self.rx = if self.position.cy < self.rows.len() {
+            let row = &self.rows[self.position.cy];
+            let xpos = self.position.cx;
+            row.cx_to_rx(xpos)
         } else {
             0
         };
         // scroll before page
-        if self.cy < self.rowoff {
-            self.rowoff = self.cy;
+        if self.position.cy < self.position.rowoff {
+            self.position.rowoff = self.position.cy;
         }
         // scroll past page
-        if self.cy >= self.rowoff + self.screenrows {
+        if self.position.cy >= self.position.rowoff + self.screenrows {
             // one page up from current y pos
-            self.rowoff = self.cy - self.screenrows + 1;
+            self.position.rowoff = self.position.cy - self.screenrows + 1;
         }
-        if self.rx < self.coloff {
-            self.coloff = self.rx;
+        if self.rx < self.position.coloff {
+            self.position.coloff = self.rx;
         }
-        if self.rx >= self.coloff + self.screencols {
-            self.coloff = self.rx - self.screencols + 1;
+        if self.rx >= self.position.coloff + self.screencols {
+            self.position.coloff = self.rx - self.screencols + 1;
         }
     }
 
@@ -371,84 +526,62 @@ impl Editor {
         let handle = &mut io::stdin();
         let kp = editor_read_key(handle);
         match kp {
-            Keypress::Sp(Special::Quit) => {
+            // editor commands
+            Keypress::Quit => {
                 if self.dirty > 0 && self.quit_times > 0 {
                     let quits_left = self.quit_times;
-                    self.set_status_message(format!("WARNING!!! File has unsaved changes. Press Ctrl-Q {} more times to quit.", quits_left));
+                    let msg = format!("WARNING!!! File has unsaved changes. Press Ctrl-Q {} more times to quit.",
+                                      quits_left);
+                    self.set_status_message(msg);
                     self.quit_times -= 1;
                     return true;
                 }
                 return false;
-            },
-            Keypress::Sp(Special::Save) => {
+            }
+            Keypress::Save => {
                 match self.save() {
                     Ok(len) => self.set_status_message(format!("{} bytes written to disk", len)),
                     Err(e) => self.set_status_message(format!("Can't save! I/O error: {}", e)),
                 };
-            },
-            Keypress::Sp(Special::Page(dir)) => {
+            }
+            Keypress::Find => self.find(),
+
+            // movement
+            Keypress::Ar(arrow) => self.move_cursor(arrow),
+            Keypress::Page(dir) => {
                 match dir {
-                    Arrow::Up => self.cy = self.rowoff,
+                    Arrow::Up => self.position.cy = self.position.rowoff,
                     Arrow::Down => {
-                        self.cy = min(self.rowoff + self.screenrows - 1, self.rows.len())
+                        self.position.cy = min(self.position.rowoff + self.screenrows - 1,
+                                               self.rows.len())
                     }
                     _ => panic!("illegal paging"),
                 }
                 for _ in 0..self.screenrows {
                     self.move_cursor(dir);
                 }
-            },
-            Keypress::Sp(Special::Home) => self.cx = 0,
-            Keypress::Sp(Special::End) => {
-                if self.cy < self.rows.len() {
-                    self.cx = self.rows[self.cy].len;
+            }
+            Keypress::Home => self.position.cx = 0,
+            Keypress::End => {
+                if self.position.cy < self.rows.len() {
+                    self.position.cx = self.rows[self.position.cy].len;
                 }
             }
-            Keypress::Sp(Special::Enter) => self.insert_newline(),
-            Keypress::Sp(Special::Backspace)  | Keypress::Sp(Special::CtrlH) => self.delete_char(),
-            Keypress::Sp(Special::Del) => {
+
+            // editing
+            Keypress::Enter => self.insert_newline(),
+            Keypress::Backspace | Keypress::CtrlH => self.delete_char(),
+            Keypress::Del => {
                 self.move_cursor(Arrow::Right);
                 self.delete_char();
             }
-            Keypress::Ar(arrow) => self.move_cursor(arrow),
+
+            // do nothing with Esc when editing
+            Keypress::Esc => (),
             Keypress::Ch(c) => self.insert_char(c),
         };
         self.quit_times = QUIT_TIMES;
         true
-    }
-
-    fn prompt(&mut self, prompt: &str) -> io::Result<String> {
-        let handle = &mut io::stdin();
-        let mut input = String::with_capacity(128);
-        loop {
-            self.set_status_message(prompt.replace("{}", &input));
-            self.refresh_screen()?;
-
-            let keypress = editor_read_key(handle);
-            match keypress {
-                Keypress::Sp(Special::Backspace) | Keypress::Sp(Special::Del) | Keypress::Sp(Special::CtrlH) => {
-                    let input_len = input.len();
-                    if input_len > 0 {
-                        input.remove(input_len - 1);
-                    }
-                }
-                Keypress::Sp(Special::Enter) => {
-                    if !input.is_empty() {
-                        self.set_status_message("".to_string());
-                        return Ok(input);
-                    }
-                },
-                Keypress::Ch('\x1b') => {
-                    self.set_status_message("".to_string());
-                    return Ok(String::new());
-                },
-                Keypress::Ch(c) => {
-                    input.push(c);
-                }
-                _ => (),
-            }
-
-        }
     }
 
     fn refresh_screen(&mut self) -> io::Result<()> {
@@ -459,32 +592,37 @@ impl Editor {
         v.extend(self.draw_rows());
         v.extend(self.draw_status_bar());
         v.extend(self.draw_message_bar());
-        v.extend(to_pos(self.rx + 1 - self.coloff, (self.cy + 1) - self.rowoff));
+        v.extend(to_pos(self.rx + 1 - self.position.coloff,
+                        (self.position.cy + 1) - self.position.rowoff));
         v.extend(ENABLE_CURSOR);
         execute(&v)
     }
 
     fn draw_status_bar(&self) -> Vec<u8> {
-        let display_name = if self.filename.is_empty() {"[No name]"} else {&self.filename};
+        let display_name = if self.filename.is_empty() {
+            "[No name]"
+        } else {
+            &self.filename
+        };
         let mut v: Vec<u8> = Vec::new();
-        v.extend(b"\x1b[7m");
+        v.extend(INVERTED_COLOR);
         let lstatus = format!("{} - {} lines {}",
                               &display_name[..min(display_name.len(), 20)],
                               self.rows.len(),
                               if self.dirty != 0 { "(modified)" } else { "" });
-        let rstatus = format!("{}/{}", self.cy + 1, self.rows.len());
+        let rstatus = format!("{}/{}", self.position.cy + 1, self.rows.len());
         let truncated = &lstatus[0..min(lstatus.len(), (self.screencols - rstatus.len()))];
         v.extend(truncated.as_bytes());
         v.extend(std::iter::repeat(b' ').take(self.screencols - truncated.len() - rstatus.len()));
         v.extend(rstatus.as_bytes());
-        v.extend(b"\x1b[m");
+        v.extend(NORMAL_COLOR);
         v.extend(b"\r\n");
         v
     }
 
     fn draw_message_bar(&mut self) -> Vec<u8> {
         let mut v: Vec<u8> = Vec::new();
-        v.extend(b"\x1b[K");
+        v.extend(CLEAR_LINE);
         if !self.status_msg.is_empty() && get_time().sub(self.status_time).num_seconds() < 5 {
             v.extend(self.status_msg.as_bytes());
         }
@@ -495,7 +633,7 @@ impl Editor {
         let mut v = Vec::new();
         for y in 0..self.screenrows {
             v.extend(CLEAR_LINE);
-            let filerow = self.rowoff + y;
+            let filerow = self.position.rowoff + y;
             if filerow >= self.rows.len() {
                 if self.rows.is_empty() && y == self.screenrows / 3 {
                     let welcome = format!("Kilo editor -- version {}\r\n", VERSION);
@@ -510,15 +648,14 @@ impl Editor {
                 }
             } else {
                 let line = &self.rows[filerow].rendered;
-                let available_text = max(line.len() as i32 - self.coloff as i32, 0);
+                let available_text = max(line.len() as i32 - self.position.coloff as i32, 0);
                 let len = min(available_text, self.screencols as i32) as usize;
-                let start = if len > 0 { self.coloff } else { 0 };
+                let start = if len > 0 { self.position.coloff } else { 0 };
                 v.extend(line[start..start + len].as_bytes());
                 v.extend(b"\r\n")
             }
         }
         v.extend(CLEAR_LINE);
-        // v.extend(b"~");
         v
     }
 }
@@ -558,11 +695,11 @@ fn editor_read_key(handle: &mut Read) -> Keypress {
                 (b'[', b'0'...b'9') => {
                     if let Some(c3) = read1(handle) {
                         match (c3, c2) {
-                            (b'~', b'1') | (b'~', b'7') => return Keypress::Sp(Special::Home),
-                            (b'~', b'4') | (b'~', b'8') => return Keypress::Sp(Special::End),
-                            (b'~', b'3') => return Keypress::Sp(Special::Del),
-                            (b'~', b'5') => return Keypress::Sp(Special::Page(Arrow::Up)),
-                            (b'~', b'6') => return Keypress::Sp(Special::Page(Arrow::Down)),
+                            (b'~', b'1') | (b'~', b'7') => return Keypress::Home,
+                            (b'~', b'4') | (b'~', b'8') => return Keypress::End,
+                            (b'~', b'3') => return Keypress::Del,
+                            (b'~', b'5') => return Keypress::Page(Arrow::Up),
+                            (b'~', b'6') => return Keypress::Page(Arrow::Down),
                             (_, _) => (),
                         }
                     }
@@ -571,19 +708,21 @@ fn editor_read_key(handle: &mut Read) -> Keypress {
                 (b'[', b'B') => return Keypress::Ar(Arrow::Down),
                 (b'[', b'C') => return Keypress::Ar(Arrow::Right),
                 (b'[', b'D') => return Keypress::Ar(Arrow::Left),
-                (b'[', b'H') | (b'O', b'H') => return Keypress::Sp(Special::Home),
-                (b'[', b'F') | (b'O', b'F') => return Keypress::Sp(Special::End),
+                (b'[', b'H') | (b'O', b'H') => return Keypress::Home,
+                (b'[', b'F') | (b'O', b'F') => return Keypress::End,
                 _ => (),
             }
         }
+        return Keypress::Esc;
     }
     match c {
-        127 => Keypress::Sp(Special::Backspace),
-        b'\r' => Keypress::Sp(Special::Enter),
-        CTRLH => Keypress::Sp(Special::CtrlH),
-        QUIT => Keypress::Sp(Special::Quit),
-        SAVE => Keypress::Sp(Special::Save),
-        _ => Keypress::Ch(c as char)
+        127 => Keypress::Backspace,
+        b'\r' => Keypress::Enter,
+        CTRLH => Keypress::CtrlH,
+        QUIT => Keypress::Quit,
+        SAVE => Keypress::Save,
+        FIND => Keypress::Find,
+        _ => Keypress::Ch(c as char),
     }
 }
 
@@ -600,16 +739,14 @@ fn execute(v: &[u8]) -> io::Result<()> {
 }
 
 fn get_cursor_position() -> io::Result<(u16, u16)> {
-    execute(b"\x1b[6n")?;
+    execute(GET_CURSOR_POS)?;
 
+    // read back answer from terminal
     let mut vec = Vec::new();
-
     let stdin = io::stdin();
     let mut handle = stdin.lock();
     handle.read_until(b'R', &mut vec)?;
 
-    //println!("{:?}", &vec);
-    //println!("{}", std::str::from_utf8(&vec[2..]).unwrap());
     if vec[0] != 0x1b || vec[1] != b'[' {
         return Err(io::Error::new(io::ErrorKind::Other, "invalid tty response"));
     }
@@ -624,17 +761,6 @@ fn get_cursor_position() -> io::Result<(u16, u16)> {
     Ok((v[0], v[1]))
 }
 
-fn cx_to_rx(row: &[u8], cx: usize) -> usize {
-    let mut rx = 0;
-    for &c in row[0..cx].iter() {
-        if c == b'\t' {
-            rx += (TABSTOP - 1) - (rx % TABSTOP)
-        }
-        rx += 1;
-    }
-    rx
-}
-
 
 fn main() {
     let rawterm = RawTerm::from(libc::STDIN_FILENO).unwrap();
@@ -642,7 +768,7 @@ fn main() {
     args()
         .nth(1)
         .map(|filename| editor.open(&filename).unwrap());
-    editor.set_status_message("HELP: Ctrl-S = save | Ctrl-Q = quit".to_owned());
+    editor.set_status_message("HELP: Ctrl-S = save | Ctrl-Q = quit | Ctrl-F = find".to_owned());
     loop {
         editor.refresh_screen().unwrap();
         if !editor.process_keypress() {
@@ -650,4 +776,3 @@ fn main() {
         }
     }
 }
-
