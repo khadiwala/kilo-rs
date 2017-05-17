@@ -3,6 +3,9 @@ extern crate termios;
 extern crate ioctl_rs as ioctl;
 extern crate time;
 
+#[macro_use]
+extern crate bitflags;
+
 use std::env::args;
 use std::fs::File;
 use std::ops::Sub;
@@ -17,10 +20,12 @@ use termios::*;
 
 // editor config
 const VERSION: &'static str = "0.0.1";
+// Tabs are rendered to spaces
 const TABSTOP: usize = 8;
+// Issue QUIT_TIMES quits to exit with a dirty file
 const QUIT_TIMES: u8 = 3;
 
-// ANSI codes
+// ANSI/VT100 codes
 const CLEAR: &'static [u8] = b"\x1b[2J";
 const CLEAR_LINE: &'static [u8] = b"\x1b[K";
 const SET_CURSOR: &'static [u8] = b"\x1b[H";
@@ -35,6 +40,94 @@ const SAVE: u8 = (b's' & 0x1f);
 const QUIT: u8 = (b'q' & 0x1f);
 const FIND: u8 = (b'f' & 0x1f);
 const CTRLH: u8 = (b'h' & 0x1f);
+
+// syntax highlighting options
+bitflags! {
+    flags SynConfig: u8 {
+        const HL_NUMBERS  = 0b00000001,
+        const HL_STRINGS  = 0b00000010,
+
+        const DISABLED = 0b00000000,
+        const RUST_CONFIG = HL_NUMBERS.bits | HL_STRINGS.bits
+    }
+}
+
+/// Syntax highlighting configuration for rust
+const RS_SYNTAX: &Syntax = &Syntax {
+    filetype: "rust",
+    comment_start: "//",
+    filematch: &["rs"],
+    flags: RUST_CONFIG,
+    // use keywords1 for reserved words/builtins
+    keywords1: &["abstract", "alignof", "as", "become", "box", "break", "const", "continue",
+                 "crate", "do", "else", "enum", "extern", "false", "final", "fn", "for", "if",
+                 "impl", "in", "let", "loop", "macro", "match", "mod", "move", "mut", "offsetof",
+                 "override", "priv", "proc", "pub", "pure", "ref", "return", "Self", "self",
+                 "sizeof", "static", "struct", "super", "trait", "true", "type", "typeof",
+                 "unsafe", "unsized", "use", "virtual", "where", "while", "yield", "bool", "char",
+                 "str"],
+    // use keywords2 for primitives
+    keywords2: &["i8", "i16", "i32", "i64", "u8", "u16", "u32", "u64", "isize", "usize", "f32",
+                 "f64"],
+};
+
+/// No highlighting (default)
+const NO_SYNTAX: &Syntax = &Syntax {
+    filetype: "no ft",
+    comment_start: "",
+    filematch: &[],
+    flags: DISABLED,
+    keywords1: &[],
+    keywords2: &[],
+};
+
+/// To add a new syntax, define a syntax struct and add it here
+/// You can configure file extensions, comments, and keywords but not much else
+/// Syntax assumes `""`s for strings, and `''`s for characters, and the `0x`/`0b`/`0o` radix
+/// prefixes for numeric literals.
+/// You can disable these with the `flags` option
+const HLDB: [&Syntax; 2] = [RS_SYNTAX, NO_SYNTAX];
+
+/// Configuration for a syntax highlighting type
+struct Syntax<'a> {
+    comment_start: &'a str, // Prefix for line comments
+    filetype: &'a str, // Name that is printed in status messages
+    filematch: &'a [&'a str], // Extensions that map to this filetype
+
+    // A list of words that should be highlighted.
+    // There are two colors available for highlighting keywords.
+    // keywords are highlighted if they are prefixed and suffixed with a seperator
+    keywords1: &'a [&'a str],
+    keywords2: &'a [&'a str],
+
+    flags: SynConfig, // Highlighting features to enable/disable
+}
+
+#[derive(Copy, Clone, Eq, PartialEq)]
+enum Highlight {
+    Normal,
+    Number,
+    Strings,
+    Comment,
+    Keyword1,
+    Keyword2,
+    Match, // for search highlighting
+}
+impl Highlight {
+    /// Map a syntax color type from the Highlight enum to
+    /// an ansi code
+    fn color(hl: Highlight) -> u8 {
+        match hl {
+            Highlight::Number => 31, // red
+            Highlight::Match => 34, // blue
+            Highlight::Strings => 35, // magenta
+            Highlight::Comment => 36, // cyan
+            Highlight::Keyword1 => 33, //yellow
+            Highlight::Keyword2 => 32, //green
+            _ => 37,
+        }
+    }
+}
 
 
 #[derive(PartialEq, Eq, Clone, Copy)]
@@ -57,7 +150,7 @@ enum Keypress {
     Find,
     Quit,
     Esc,
-    Ch(char),
+    Chr(char),
 }
 
 struct RawTerm(Termios);
@@ -81,19 +174,31 @@ impl RawTerm {
     }
 }
 
+impl Drop for RawTerm {
+    fn drop(&mut self) {
+        println!("restoring terminal");
+        execute(CLEAR).unwrap();
+        execute(SET_CURSOR).unwrap();
+        tcsetattr(libc::STDIN_FILENO, TCSANOW, &self.0).unwrap();
+    }
+}
+
+// populated by libc::ioctl call
 #[repr(C)]
 #[derive(Default)]
 struct Winsize {
-    // rows, in characters
-    ws_row: c_ushort,
-    // columns, in characters
-    ws_col: c_ushort,
-    // horizontal size, pixels
-    ws_xpixel: c_ushort,
-    // vertical size, pixels
-    ws_ypixel: c_ushort,
+    ws_row: c_ushort, // rows, in characters
+    ws_col: c_ushort, // columns, in characters
+    ws_xpixel: c_ushort, // horizontal size, pixels
+    ws_ypixel: c_ushort, // vertical size, pixels
 }
 
+/// Get window size using ioctl if it is available
+///
+/// Uses the TIOCGWINSZ request (Terminal IO Get Window Size)
+///
+/// # Return value
+/// Return the (height, width) of the terminal or an error
 fn ioctl_window_size() -> io::Result<(u16, u16)> {
     let mut w: Winsize = Default::default();
     match unsafe { libc::ioctl(libc::STDIN_FILENO, libc::TIOCGWINSZ, &mut w) } {
@@ -107,58 +212,93 @@ fn ioctl_window_size() -> io::Result<(u16, u16)> {
                   })
 }
 
+/// Get window size using vt100 codes
+///
+/// # Return value
+/// Return the (height, width) of the terminal or an error
 fn tty_window_size() -> io::Result<(u16, u16)> {
     io::stdout().write_all(b"\x1b[999C\x1b[999B")?;
     io::stdout().flush()?;
     get_cursor_position()
 }
 
+/// Get window size
+///
+/// Uses ioctl if available, otherwise falling back to vt100
+///
+/// # Return value
+/// Return the (height, width) of the terminal or an error
 fn get_window_size() -> io::Result<(u16, u16)> {
     ioctl_window_size().or_else(|_| tty_window_size())
 }
 
+
+/// Represents a row of text in the editor
+///
+/// Contains both the source text and a rendering. Rerenders text on modifications.
 struct Row {
     orig: String,
     rendered: String,
+    highlights: Vec<Highlight>,
+    syntax: &'static Syntax<'static>,
     len: usize,
 }
 
 impl Row {
-    fn from(line: String) -> Row {
+    fn from(line: String, syntax: &'static Syntax) -> Row {
         let rendered = Row::render(&line);
+        let highlights = syntax.highlight(&rendered);
         let len = line.len();
         Row {
             rendered: rendered,
             orig: line,
+            highlights: highlights,
             len: len,
+            syntax: syntax,
         }
     }
 
+    /// insert a character `c` at `at` and rerender the text
     fn insert_char(&mut self, at: usize, c: char) {
         self.orig.insert(min(at, self.len), c);
-        self.len += 1;
-        self.rendered = Row::render(&self.orig);
+        self.update();
     }
 
+    /// delete character at `at` and rerender the text
     fn delete_char(&mut self, at: usize) {
         self.orig.remove(at);
-        self.len -= 1;
-        self.rendered = Row::render(&self.orig);
+        self.update();
     }
 
+    /// Append a row `r` to this row
     fn push(&mut self, r: &Row) {
         self.orig.push_str(&r.orig);
-        self.len += r.len;
-        self.rendered = Row::render(&self.orig);
+        self.update();
     }
 
+    /// Split this at `at`, returning ownership of the new `Row` to caller.
     fn split_off(&mut self, at: usize) -> Row {
         let right = self.orig.split_off(at);
-        self.len = at;
-        self.rendered = Row::render(&self.orig);
-        Row::from(right)
+        self.update();
+        Row::from(right, self.syntax)
     }
 
+    /// Set the Highlight for a subrange of the rendered row
+    fn highlight_range(&mut self, hl: Highlight, rstart: usize, rend: usize) {
+        for i in rstart..rend {
+            self.highlights[i] = hl;
+        }
+    }
+
+    /// Update derrived structures after modifications to `self.orig`
+    fn update(&mut self) {
+        self.rendered = Row::render(&self.orig);
+        self.highlights = self.syntax.highlight(&self.rendered);
+        self.len = self.orig.len();
+    }
+
+
+    /// Translate a position in the original text to a position in the rendered text.
     fn cx_to_rx(&self, cx: usize) -> usize {
         let row = self.orig.as_bytes();
         let mut rx = 0;
@@ -170,6 +310,8 @@ impl Row {
         }
         rx
     }
+
+    /// Translate a position in the rendered text to a position in the original text.
     fn rx_to_cx(&self, rx: usize) -> usize {
         let row = self.orig.as_bytes();
         let mut cur_rx = 0;
@@ -207,49 +349,74 @@ impl Row {
     }
 }
 
+/// A position in the editor.
+///
+/// Contains geometric cursor position wrt the window and the offsets wrt to the file.
 #[derive(Clone, Copy, Default)]
 struct Position {
     // current x position
     cx: usize,
     // current y position
     cy: usize,
+    // row offset into the file
     rowoff: usize,
+    // col offset into the file
     coloff: usize,
 }
 
 struct Editor {
-    term: RawTerm,
+    _term: RawTerm,
     screenrows: usize,
     screencols: usize,
     position: Position,
-
     // current x position in rendered row
     rx: usize,
-
     rows: Vec<Row>,
     filename: String,
+    syntax: &'static Syntax<'static>,
     dirty: usize,
     quit_times: u8,
     status_msg: String,
     status_time: Timespec,
 }
 
+/// A callback that can be called live as the user interacts with the prompt
+///
+/// Used with the `Editor.prompt` method
 trait PromptCallback {
-    fn callback(&mut self, &mut Editor, &str, Keypress);
+    /// A function that is called on every keypress in the prompt
+    ///
+    /// # Arguments
+    /// * `editor` - Editor instance since `Editor::prompt` will have a borrow on `editor`
+    /// * `partial_input` - The current input the user has entered
+    /// * `keypress` - The last keypress (A character or control sequence)
+    fn callback(&mut self, editor: &mut Editor, partial_input: &str, keypress: Keypress);
 }
 
+/// A `PromptCallback` that does nothing
 struct EmptyCallback();
 impl PromptCallback for EmptyCallback {
     fn callback(&mut self, _: &mut Editor, _: &str, _: Keypress) {}
 }
 
+/// A `PromptCallback` that searchs for the user's query.
+///
+/// Moves the cursor to the position of the first match as the user types, moving to other matches with the arrow key.
 struct FindPromptCallback {
     direction: i32,
     last_match: i32,
+    saved_hl: Vec<Highlight>,
 }
 
 impl PromptCallback for FindPromptCallback {
     fn callback(&mut self, editor: &mut Editor, partial_input: &str, kp: Keypress) {
+        if !self.saved_hl.is_empty() {
+            // empty saved_hl into a new vector
+            let mut v = Vec::new();
+            v.append(&mut self.saved_hl);
+            editor.rows[self.last_match as usize].highlights = v;
+        }
+
         match kp {
             Keypress::Enter | Keypress::Esc => return,
             Keypress::Ar(Arrow::Right) |
@@ -265,6 +432,7 @@ impl PromptCallback for FindPromptCallback {
             .iter()
             .find(|q| !q.is_empty())
             .and_then(|q| {
+                // there's a non-empty search query
                 if self.last_match == -1 {
                     self.direction = 1
                 };
@@ -288,21 +456,23 @@ impl PromptCallback for FindPromptCallback {
                 None
             })
             .map(|(rowidx, colidx)| {
-                let brow = &editor.rows[rowidx];
+                // Found a match, update cursor position, highlight
                 self.last_match = rowidx as i32;
-                editor.position.cy = rowidx;
-                editor.position.cx = brow.rx_to_cx(colidx);
+                self.saved_hl = editor.rows[rowidx].highlights.clone();
                 editor.position.rowoff = editor.rows.len();
+                editor.position.cy = rowidx;
+                let brow = &mut editor.rows[rowidx];
+                editor.position.cx = brow.rx_to_cx(colidx);
+                brow.highlight_range(Highlight::Match, colidx, colidx + partial_input.len());
             });
     }
 }
-
 
 impl Editor {
     fn from(rt: RawTerm) -> io::Result<Editor> {
         let (rows, cols) = get_window_size()?;
         Ok(Editor {
-               term: rt,
+               _term: rt,
                // leave two rows for status
                screenrows: (rows - 2) as usize,
                screencols: cols as usize,
@@ -314,20 +484,24 @@ impl Editor {
                quit_times: QUIT_TIMES,
                status_msg: "".to_owned(),
                status_time: Timespec::new(0, 0),
+               syntax: NO_SYNTAX,
            })
     }
 
+    /// Open a file and load all lines into the editor
     fn open(&mut self, filename: &str) -> io::Result<()> {
         self.filename = filename.to_owned();
+        self.syntax = Syntax::from(filename);
         let f = File::open(filename)?;
         let handle = BufReader::new(f);
         for rline in handle.lines() {
             let line = rline?;
-            self.rows.push(Row::from(line));
+            self.rows.push(Row::from(line, self.syntax));
         }
         Ok(())
     }
 
+    /// Return a single String with the current text of all rows
     fn rows_to_file(&self) -> String {
         self.rows
             .iter()
@@ -339,11 +513,17 @@ impl Editor {
             })
     }
 
+    /// Save current editor state to a file, prompting for filename if it was not provided.
+    ///
+    /// # Return Value
+    /// The number of bytes saved to `self.filename`, if the save was successful.
     fn save(&mut self) -> io::Result<usize> {
         if self.filename == "" {
             self.filename = self.prompt("Save as: {} (ESC to cancel)", &mut EmptyCallback())?;
             if self.filename == "" {
                 return Ok(0);
+            } else {
+                self.syntax = Syntax::from(&self.filename);
             }
         }
         let file_content = self.rows_to_file();
@@ -356,18 +536,22 @@ impl Editor {
         Ok(len)
     }
 
+    /// Open a prompt and search for user's input.
     fn find(&mut self) {
+        // Save the position from before the start of the search
         let initial = self.position;
-
         let last = self.prompt("Seach: {} (Use ESC/Arrows/Enter)",
                                &mut FindPromptCallback {
                                         direction: 1,
                                         last_match: -1,
+                                        saved_hl: Vec::new(),
                                     });
         last.ok()
             .iter()
             .find(|s| !s.is_empty())
             .map(|_| ())
+            // If the prompt returned empty, the user cancelled the operation,
+            // set the cursor back to the original position
             .unwrap_or_else(|| self.position = initial);
     }
 
@@ -380,7 +564,7 @@ impl Editor {
             self.set_status_message(prompt.replace("{}", &input));
             self.refresh_screen()?;
 
-            let keypress = editor_read_key(handle);
+            let keypress = Self::editor_read_key(handle);
             match keypress {
                 Keypress::Backspace | Keypress::Del | Keypress::CtrlH => {
                     let input_len = input.len();
@@ -400,7 +584,7 @@ impl Editor {
                     callback.callback(self, &input, keypress);
                     return Ok(String::new());
                 }
-                Keypress::Ch(c) => {
+                Keypress::Chr(c) => {
                     input.push(c);
                 }
                 _ => (),
@@ -411,7 +595,7 @@ impl Editor {
 
     fn insert_char(&mut self, c: char) {
         if self.position.cy == self.rows.len() {
-            self.rows.push(Row::from(String::new()))
+            self.rows.push(Row::from(String::new(), self.syntax))
         }
         self.rows[self.position.cy].insert_char(self.position.cx, c);
         self.position.cx += 1;
@@ -423,7 +607,8 @@ impl Editor {
             return;
         }
         if self.position.cx == 0 {
-            self.rows.insert(self.position.cy, Row::from(String::new()));
+            self.rows
+                .insert(self.position.cy, Row::from(String::new(), self.syntax));
         } else {
             let next = self.rows[self.position.cy].split_off(self.position.cx);
             self.rows.insert(self.position.cy + 1, next);
@@ -524,7 +709,7 @@ impl Editor {
 
     fn process_keypress(&mut self) -> bool {
         let handle = &mut io::stdin();
-        let kp = editor_read_key(handle);
+        let kp = Self::editor_read_key(handle);
         match kp {
             // editor commands
             Keypress::Quit => {
@@ -578,7 +763,7 @@ impl Editor {
 
             // do nothing with Esc when editing
             Keypress::Esc => (),
-            Keypress::Ch(c) => self.insert_char(c),
+            Keypress::Chr(c) => self.insert_char(c),
         };
         self.quit_times = QUIT_TIMES;
         true
@@ -610,7 +795,10 @@ impl Editor {
                               &display_name[..min(display_name.len(), 20)],
                               self.rows.len(),
                               if self.dirty != 0 { "(modified)" } else { "" });
-        let rstatus = format!("{}/{}", self.position.cy + 1, self.rows.len());
+        let rstatus = format!("{} | {}/{}",
+                              self.syntax.filetype,
+                              self.position.cy + 1,
+                              self.rows.len());
         let truncated = &lstatus[0..min(lstatus.len(), (self.screencols - rstatus.len()))];
         v.extend(truncated.as_bytes());
         v.extend(std::iter::repeat(b' ').take(self.screencols - truncated.len() - rstatus.len()));
@@ -651,97 +839,378 @@ impl Editor {
                 let available_text = max(line.len() as i32 - self.position.coloff as i32, 0);
                 let len = min(available_text, self.screencols as i32) as usize;
                 let start = if len > 0 { self.position.coloff } else { 0 };
-                v.extend(line[start..start + len].as_bytes());
+
+                let visible_line = line[start..start + len].as_bytes();
+                let highlights = &self.rows[filerow].highlights[start..start + len];
+                // let mut current_color: Option<Highlight> = None;
+                let mut current_color: i32 = -1;
+                for (&c, &hl) in visible_line.iter().zip(highlights) {
+                    match hl {
+                        Highlight::Normal => {
+                            if current_color != -1 {
+                                v.extend(b"\x1b[39m");
+                                current_color = -1;
+                            }
+                            v.push(c);
+                        }
+                        _ => {
+                            let color = Highlight::color(hl) as i32;
+                            if current_color != color {
+                                v.extend(format!("\x1b[{}m", color).as_bytes());
+                                current_color = color;
+                            }
+                            v.push(c)
+                        }
+                    }
+                }
+                if current_color != -1 {
+                    v.extend(b"\x1b[39m");
+                }
+                // v.extend(line[start..start + len].as_bytes());
                 v.extend(b"\r\n")
             }
         }
         v.extend(CLEAR_LINE);
         v
     }
-}
 
-impl Drop for RawTerm {
-    fn drop(&mut self) {
-        println!("restoring terminal");
-        execute(CLEAR).unwrap();
-        execute(SET_CURSOR).unwrap();
-        tcsetattr(libc::STDIN_FILENO, TCSANOW, &self.0).unwrap();
-    }
-}
+    /// Grab the next keypress from `handle`
+    ///
+    /// Polls handle until a keypress is available. If it is
+    /// a recognized escape sequence, we return the appropriate keypress
+    /// othewise we just return the character `Keypress::Chr()`
+    fn editor_read_key(handle: &mut Read) -> Keypress {
 
-fn read1(handle: &mut Read) -> Option<u8> {
-    let mut buffer: [u8; 1] = [0];
-    match handle.take(1).read(&mut buffer) {
-        Ok(1) => Some(buffer[0]),
-        Ok(0) => None,
-        Ok(_) | Err(_) => panic!("error"),
-    }
-}
-
-fn editor_read_key(handle: &mut Read) -> Keypress {
-    let c;
-    loop {
-        match read1(handle) {
-            Some(x) => {
-                c = x;
-                break;
+        // read a single byte from handle
+        fn read1(handle: &mut Read) -> Option<u8> {
+            let mut buffer: [u8; 1] = [0];
+            match handle.take(1).read(&mut buffer) {
+                Ok(1) => Some(buffer[0]),
+                Ok(0) => None,
+                Ok(_) | Err(_) => panic!("error"),
             }
-            None => continue,
         }
-    }
-    if c == b'\x1b' {
-        if let (Some(c1), Some(c2)) = (read1(handle), read1(handle)) {
-            match (c1, c2) {
-                (b'[', b'0'...b'9') => {
-                    if let Some(c3) = read1(handle) {
-                        match (c3, c2) {
-                            (b'~', b'1') | (b'~', b'7') => return Keypress::Home,
-                            (b'~', b'4') | (b'~', b'8') => return Keypress::End,
-                            (b'~', b'3') => return Keypress::Del,
-                            (b'~', b'5') => return Keypress::Page(Arrow::Up),
-                            (b'~', b'6') => return Keypress::Page(Arrow::Down),
-                            (_, _) => (),
+
+        // with raw mode we set a read timeout, so the read doesn't block waiting for data
+        let c;
+        loop {
+            match read1(handle) {
+                Some(x) => {
+                    c = x;
+                    break;
+                }
+                None => continue,
+            }
+        }
+        if c == b'\x1b' {
+            if let (Some(c1), Some(c2)) = (read1(handle), read1(handle)) {
+                match (c1, c2) {
+                    (b'[', b'0'...b'9') => {
+                        if let Some(c3) = read1(handle) {
+                            match (c3, c2) {
+                                (b'~', b'1') | (b'~', b'7') => return Keypress::Home,
+                                (b'~', b'4') | (b'~', b'8') => return Keypress::End,
+                                (b'~', b'3') => return Keypress::Del,
+                                (b'~', b'5') => return Keypress::Page(Arrow::Up),
+                                (b'~', b'6') => return Keypress::Page(Arrow::Down),
+                                (_, _) => (),
+                            }
                         }
                     }
+                    (b'[', b'A') => return Keypress::Ar(Arrow::Up),
+                    (b'[', b'B') => return Keypress::Ar(Arrow::Down),
+                    (b'[', b'C') => return Keypress::Ar(Arrow::Right),
+                    (b'[', b'D') => return Keypress::Ar(Arrow::Left),
+                    (b'[', b'H') | (b'O', b'H') => return Keypress::Home,
+                    (b'[', b'F') | (b'O', b'F') => return Keypress::End,
+                    _ => (),
                 }
-                (b'[', b'A') => return Keypress::Ar(Arrow::Up),
-                (b'[', b'B') => return Keypress::Ar(Arrow::Down),
-                (b'[', b'C') => return Keypress::Ar(Arrow::Right),
-                (b'[', b'D') => return Keypress::Ar(Arrow::Left),
-                (b'[', b'H') | (b'O', b'H') => return Keypress::Home,
-                (b'[', b'F') | (b'O', b'F') => return Keypress::End,
-                _ => (),
             }
+            return Keypress::Esc;
         }
-        return Keypress::Esc;
-    }
-    match c {
-        127 => Keypress::Backspace,
-        b'\r' => Keypress::Enter,
-        CTRLH => Keypress::CtrlH,
-        QUIT => Keypress::Quit,
-        SAVE => Keypress::Save,
-        FIND => Keypress::Find,
-        _ => Keypress::Ch(c as char),
+        match c {
+            127 => Keypress::Backspace,
+            b'\r' => Keypress::Enter,
+            CTRLH => Keypress::CtrlH,
+            QUIT => Keypress::Quit,
+            SAVE => Keypress::Save,
+            FIND => Keypress::Find,
+            _ => Keypress::Chr(c as char),
+        }
     }
 }
 
-// terminal commands
 
+// ----------------------------------
+// Syntax highlighting implementation
+// ----------------------------------
+
+/// Provides methods for providing color codes for every character in a line
+impl<'a> Syntax<'a> {
+    /// Take a filename and find the matching syntax object
+    ///
+    /// # Return value
+    /// The first syntax struct in HLDB with a matching extension, or NO_SYNTAX
+    fn from(filename: &str) -> &'static Syntax<'static> {
+        filename
+            .rsplit('.')
+            .next()
+            .and_then(|ext| {
+                HLDB.iter()
+                    .map(|&s| s)
+                    .find(|syn| syn.filematch.contains(&ext))
+            })
+            .unwrap_or(NO_SYNTAX)
+    }
+
+    /// Whether `ch` is a separator
+    ///
+    /// Separator characters can mark the beginning/ending
+    /// of units of text that can be highlighted
+    fn is_separator(ch: char) -> bool {
+        ch.is_whitespace() || ",.()+-/*=~%<>[];".contains(ch)
+    }
+
+    /// Parse a numeric literal out of line, returning Highlight codes for it.
+    ///
+    /// Numeric literals can be base10 integral, float, or binary/octal/hex
+    /// provided it is prefixed with the appropriate `0x`/`0o`/`0b` prefix
+    ///
+    /// # Return Value
+    /// a `Vec<Highlight>` containing the code for the prefix of the line that is numeric.
+    ///
+    /// # Examples
+    /// ```
+    /// assert_eq!(vec![Highlight::Number; 4], highlight_number("1234 test"));
+    /// assert_eq!(vec![Highlight::Number; 4], highlight_number("0xCA test"));
+    /// assert_eq!(Vec::new(), highlight_number("notnumber 1234 0xCA test"));
+    /// ```
+    fn highlight_number(line: &str) -> Vec<Highlight> {
+        let bs = line.as_bytes();
+
+        // numeric literals all start with a base 10 digit or 0
+        let starts_numeric = (bs[0] as char).is_digit(10);
+        if bs.len() == 1 || !starts_numeric {
+            if (bs[0] as char).is_digit(10) {
+                return vec![Highlight::Number];
+            }
+            return Vec::new();
+        }
+        let (radix, start) = match (bs[0], bs[1]) {
+            (b'0', b'x') => (16, 2),
+            (b'0', b'o') => (8, 2),
+            (b'0', b'b') => (2, 2),
+            _ => (10, 0),
+        };
+
+        // true if s has exactly one dot as it's prefix
+        // `4.5` is a single numeric literal, however `4..5` (a range)
+        // is not
+        fn single_dot(s: &[u8]) -> bool {
+            s[0] == b'.' && (s.len() < 2 || s[1] != b'.')
+        }
+
+        bs.iter()
+            .enumerate()
+            .take_while(|&(i, b)| {
+                let c = *b as char;
+                // when i < start, we are in the prefix (ex: `0x`)
+                // which has already been validated
+                i < start || c.is_digit(radix) || single_dot(&bs[i..])
+            })
+            .map(|_| Highlight::Number)
+            .collect()
+    }
+
+    /// Parse a quoted string out of a line, returning Highlight codes for it.
+    ///
+    /// # Return value
+    /// a `Vec<Highlight>` containing the code for the prefix of the line that is the string
+    ///
+    /// # Examples
+    /// ```
+    /// assert_eq!(vec![Highlight::Strings; 5], highlight_string("\"hi,\" she said"))
+    /// assert_eq!(Vec::new(), highlight_string("no quotes"))
+    /// assert_eq!(Vec::new(), highlight_string("'single quotes are not matched'"))
+    /// ```
+    fn highlight_string(input: &str) -> Vec<Highlight> {
+        let line = input.as_bytes();
+        let mut h = Vec::new();
+        if line.len() < 2 || line[0] != b'\"' {
+            return h;
+        }
+        h.push(Highlight::Strings);
+        let mut i = 1;
+
+        // if we encounter \, skip next character (don't check for closing quote)
+        let mut escaped = false;
+        while i < line.len() {
+            h.push(Highlight::Strings);
+            match (escaped, line[i]) {
+                (false, b'\"') => return h,
+                (false, b'\\') => escaped = true,
+                (true, _) => escaped = false,
+                _ => (),
+            }
+            i += 1;
+        }
+        h
+    }
+
+    /// Parse a single quoted character out of a line, returning Highlight codes for it.
+    ///
+    /// # Return value
+    /// a `Vec<Highlight>` containing the code for the prefix of the line that is the literal
+    ///
+    /// # Examples
+    /// ```
+    /// assert_eq!(vec![Highlight::Strings; 3], highlight_string("'c' is a char"))
+    /// assert_eq!(Vec::new(), highlight_string("no chars"))
+    /// assert_eq!(vec![Highlight::Strings; 4], highlight_string("'\'' is a char"))
+    /// ```
+    fn highlight_char_literal(input: &str) -> Vec<Highlight> {
+        let line = input.as_bytes();
+        // character literal requires at least 3 characters
+        if line[0] != b'\'' || line.len() < 3 {
+            Vec::new()
+        } else {
+            let escaped = line[1] == b'\\' && line.len() > 3;
+            let close_pos = if escaped { 3 } else { 2 };
+            if line[close_pos] == b'\'' {
+                vec![Highlight::Strings; close_pos + 1]
+            } else {
+                Vec::new()
+            }
+        }
+    }
+
+    /// Get the Highlight code to use for every character in `line`
+    ///
+    /// * `line` the line to highlight
+    /// # Return value
+    /// A `Vector<Highlight>` with a code for every character in the original `line`
+    fn highlight(&self, line: &str) -> Vec<Highlight> {
+
+        // Check if any keyword in keywords is a prefix of the string
+        // return Some(match) for the first match
+        fn keyword_match<'a>(keywords: &'a [&'a str], remainder: &str) -> Option<&'a str> {
+            keywords
+                .iter()
+                .find(|&kw| &remainder[..min(remainder.len(), kw.len())] == *kw)
+                .map(|s| *s)
+        }
+
+        // Copy the parsed highlights into existing and return the amount moved. None if
+        // parsed was empty
+        fn add_parsed(parsed: &[Highlight], existing: &mut [Highlight]) -> Option<usize> {
+            let len = parsed.len();
+            if len == 0 {
+                return None;
+            }
+            for (muth, h) in existing[..len].iter_mut().zip(parsed.iter()) {
+                *muth = *h;
+            }
+            Some(len)
+        }
+
+        let mut highlights = vec![Highlight::Normal; line.len()];
+        if self.flags.is_empty() {
+            return highlights;
+        }
+        let bs = line.as_bytes();
+        let comment_len = self.comment_start.len();
+
+        let mut prev_sep = true;
+        let mut i = 0;
+        while i < line.len() {
+            // general pattern:
+            // try to parse a prefix of the line starting at i
+            // if we find something, increment i by the amount that the parser consumed
+            // if nothing parses, just increment i by 1
+            let c = bs[i] as char;
+            if self.flags.contains(HL_STRINGS) {
+                if let Some(n) = add_parsed(&Self::highlight_string(&line[i..]),
+                                            &mut highlights[i..]) {
+                    i += n;
+                    prev_sep = false;
+                    continue;
+                }
+
+                if let Some(n) = add_parsed(&Self::highlight_char_literal(&line[i..]),
+                                            &mut highlights[i..]) {
+                    i += n;
+                    prev_sep = false;
+                    continue;
+                }
+            }
+            if self.flags.contains(HL_NUMBERS) && prev_sep {
+                if let Some(n) = add_parsed(&Self::highlight_number(&line[i..]),
+                                            &mut highlights[i..]) {
+                    i += n;
+                    prev_sep = false;
+                    continue;
+                }
+            }
+            if comment_len > 0 && &line[i..min(i + comment_len, line.len())] == self.comment_start {
+                for x in &mut highlights[i..].iter_mut() {
+                    *x = Highlight::Comment;
+                }
+                // line comments set the Highlight for the entire line suffx, so we are done
+                break;
+            }
+
+            if prev_sep {
+                // find if any keyword matched from either list and
+                // return the correct highlight code for it
+                let keyword_matched = keyword_match(self.keywords1, &line[i..])
+                    .map(|k| (k, Highlight::Keyword1))
+                    .or_else(|| {
+                        keyword_match(self.keywords2, &line[i..]).map(|k| (k, Highlight::Keyword2))
+                    });
+
+                if let Some((kw, hl)) = keyword_matched {
+                    // keywords must also be suffixed by a seperator, otherwise
+                    // words like `fort` would match a `for` keyword
+                    if bs.len() > i + kw.len() && Self::is_separator(bs[i + kw.len()] as char) {
+                        for x in (&mut highlights[i..i + kw.len()]).iter_mut() {
+                            *x = hl;
+                        }
+                        i += kw.len();
+                        prev_sep = false;
+                        continue;
+                    }
+                }
+            }
+            prev_sep = Self::is_separator(c);
+            i += 1;
+        }
+        highlights
+    }
+}
+
+
+// ------------------
+// terminal commands
+// -----------------
+
+/// Create the control sequence for moving the cursor to the specified x,y position
 fn to_pos(x: usize, y: usize) -> Vec<u8> {
     let cmd = format!("\x1b[{};{}H", y, x);
     cmd.into_bytes()
 }
 
+/// Write a control sequence to the terminal
 fn execute(v: &[u8]) -> io::Result<()> {
     io::stdout().write_all(v)?;
     io::stdout().flush()
 }
 
+/// Get the current position of the cursor using vt100
 fn get_cursor_position() -> io::Result<(u16, u16)> {
     execute(GET_CURSOR_POS)?;
 
     // read back answer from terminal
+    // the response is supposed to look like 0x1b [24;80R
     let mut vec = Vec::new();
     let stdin = io::stdin();
     let mut handle = stdin.lock();
@@ -763,16 +1232,15 @@ fn get_cursor_position() -> io::Result<(u16, u16)> {
 
 
 fn main() {
+    // log4rs::init_file("config/log4rs.yaml", Default::default()).unwrap();
     let rawterm = RawTerm::from(libc::STDIN_FILENO).unwrap();
     let mut editor = Editor::from(rawterm).unwrap();
     args()
         .nth(1)
         .map(|filename| editor.open(&filename).unwrap());
     editor.set_status_message("HELP: Ctrl-S = save | Ctrl-Q = quit | Ctrl-F = find".to_owned());
-    loop {
+    editor.refresh_screen().unwrap();
+    while editor.process_keypress() {
         editor.refresh_screen().unwrap();
-        if !editor.process_keypress() {
-            break;
-        }
     }
 }
