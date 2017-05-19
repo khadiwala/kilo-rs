@@ -153,30 +153,44 @@ enum Keypress {
     Chr(char),
 }
 
+/// Use Termios API to switch into raw mode
+///
+/// Store the original terminal flags and restore them on `drop`
 struct RawTerm(Termios);
 impl RawTerm {
+    /// Switch into raw mode, return a Rawterm object that can be `dropped` to restore
     fn from(fd: RawFd) -> io::Result<RawTerm> {
         let term = RawTerm(Termios::from_fd(fd)?);
         term.enable_raw()?;
         Ok(term)
     }
 
+    /// Enable raw mode
     fn enable_raw(&self) -> io::Result<()> {
         let mut raw = self.0;
-        raw.c_cflag |= CS8;
+        // input - No break, no parity check, no strip char, no start/stop output, No CR to NL
         raw.c_iflag &= !(BRKINT | INPCK | ISTRIP | IXON | ICRNL);
+        // output - no post processing
         raw.c_oflag &= !(OPOST);
+        // control modes - set 8 bit chars
+        raw.c_cflag |= CS8;
+        // local modes - echoing off, canonical off, no signal chars (^Z, ^C), no extended functions
         raw.c_lflag &= !(ECHO | ICANON | ISIG | IEXTEN);
 
+        // minimum number of bytes that can be returned
         raw.c_cc[VMIN] = 0;
+        // 100ms timeout
         raw.c_cc[VTIME] = 1;
+
         tcsetattr(libc::STDIN_FILENO, TCSANOW, &raw)
     }
 }
 
+/// Restores to the previous `Termios` state on drop
+///
+/// Additionally, clears any output on the screen and sets curstor to 0,0 using VT100 codes
 impl Drop for RawTerm {
     fn drop(&mut self) {
-        println!("restoring terminal");
         execute(CLEAR).unwrap();
         execute(SET_CURSOR).unwrap();
         tcsetattr(libc::STDIN_FILENO, TCSANOW, &self.0).unwrap();
@@ -206,10 +220,10 @@ fn ioctl_window_size() -> io::Result<(u16, u16)> {
             _ => Err(io::Error::last_os_error()),
         }
         .and_then(|(row, col)| if col == 0 {
-                      Err(io::Error::new(io::ErrorKind::Other, "ioctl error"))
-                  } else {
-                      Ok((row, col))
-                  })
+            Err(io::Error::new(io::ErrorKind::Other, "ioctl error"))
+        } else {
+            Ok((row, col))
+        })
 }
 
 /// Get window size using vt100 codes
@@ -245,6 +259,10 @@ struct Row {
 }
 
 impl Row {
+    /// Create a row, usually from some source text
+    ///
+    /// * The source text of the line
+    /// * The Syntax to use to provide syntax highlighting
     fn from(line: String, syntax: &'static Syntax) -> Row {
         let rendered = Row::render(&line);
         let highlights = syntax.highlight(&rendered);
@@ -327,6 +345,9 @@ impl Row {
         row.len() - 1
     }
 
+    /// Change source text into what is displated
+    ///
+    /// Expands tabs into spaces according to TABSTOP
     fn render(line: &str) -> String {
         // count tabs so we only need to make a single allocation
         let tabs = line.as_bytes().iter().filter(|c| **c == b'\t').count();
@@ -364,6 +385,7 @@ struct Position {
     coloff: usize,
 }
 
+/// Contains state associated with the editor instance
 struct Editor {
     _term: RawTerm,
     screenrows: usize,
@@ -372,9 +394,12 @@ struct Editor {
     // current x position in rendered row
     rx: usize,
     rows: Vec<Row>,
+    // the name of the file, empty if there isn't one
     filename: String,
     syntax: &'static Syntax<'static>,
+    // nonzeo if the file has been modified but not saved
     dirty: usize,
+    // number of times we've quit (relevant when we're trying to quit with a dirty file)
     quit_times: u8,
     status_msg: String,
     status_time: Timespec,
@@ -399,12 +424,12 @@ impl PromptCallback for EmptyCallback {
     fn callback(&mut self, _: &mut Editor, _: &str, _: Keypress) {}
 }
 
-/// A `PromptCallback` that searchs for the user's query.
+/// A `PromptCallback` that searches for the user's query.
 ///
 /// Moves the cursor to the position of the first match as the user types, moving to other matches with the arrow key.
 struct FindPromptCallback {
     direction: i32,
-    last_match: i32,
+    last_match: i32, //indicates row of last match, -1 when there's no match
     saved_hl: Vec<Highlight>,
 }
 
@@ -469,23 +494,24 @@ impl PromptCallback for FindPromptCallback {
 }
 
 impl Editor {
+    /// Create a Editor struct from a Rawterm struct
     fn from(rt: RawTerm) -> io::Result<Editor> {
         let (rows, cols) = get_window_size()?;
         Ok(Editor {
-               _term: rt,
-               // leave two rows for status
-               screenrows: (rows - 2) as usize,
-               screencols: cols as usize,
-               position: Default::default(),
-               rx: 0,
-               rows: Vec::new(),
-               filename: String::new(),
-               dirty: 0,
-               quit_times: QUIT_TIMES,
-               status_msg: "".to_owned(),
-               status_time: Timespec::new(0, 0),
-               syntax: NO_SYNTAX,
-           })
+            _term: rt,
+            // leave two rows for status
+            screenrows: (rows - 2) as usize,
+            screencols: cols as usize,
+            position: Default::default(),
+            rx: 0,
+            rows: Vec::new(),
+            filename: String::new(),
+            dirty: 0,
+            quit_times: QUIT_TIMES,
+            status_msg: "".to_owned(),
+            status_time: Timespec::new(0, 0),
+            syntax: NO_SYNTAX,
+        })
     }
 
     /// Open a file and load all lines into the editor
@@ -542,10 +568,10 @@ impl Editor {
         let initial = self.position;
         let last = self.prompt("Seach: {} (Use ESC/Arrows/Enter)",
                                &mut FindPromptCallback {
-                                        direction: 1,
-                                        last_match: -1,
-                                        saved_hl: Vec::new(),
-                                    });
+                                   direction: 1,
+                                   last_match: -1,
+                                   saved_hl: Vec::new(),
+                               });
         last.ok()
             .iter()
             .find(|s| !s.is_empty())
@@ -555,6 +581,20 @@ impl Editor {
             .unwrap_or_else(|| self.position = initial);
     }
 
+    /// Display the prompt to the user and trigger the `PromptCallback` on every keypress
+    ///
+    /// Switches focus to the status bar. A Enter or Esc keypress ends the prompt interaction.
+    ///
+    /// * prompt string to display in the status bar, must contain one `{}` where the user's input
+    ///          will appear as they type
+    /// * callback the callback to be triggered on each keypress. The callback will be passed the
+    ///            last `Keypress`, the user input so far, and a mutable editor reference since
+    ///            this method has mutable ownership of the Editor and a callback may need to
+    ///            modify it.
+    ///
+    /// # Return value
+    /// The state of the user's input when Enter was pressed, or empty string if the prompt was
+    /// cancelled via Esc
     fn prompt<T>(&mut self, prompt: &str, callback: &mut T) -> io::Result<String>
         where T: PromptCallback
     {
@@ -593,6 +633,7 @@ impl Editor {
         }
     }
 
+    /// insert a char at the current position
     fn insert_char(&mut self, c: char) {
         if self.position.cy == self.rows.len() {
             self.rows.push(Row::from(String::new(), self.syntax))
@@ -602,6 +643,8 @@ impl Editor {
         self.dirty += 1;
     }
 
+    /// insert a newline at the current position, which might split
+    /// one `Row` into two.
     fn insert_newline(&mut self) {
         if self.position.cy > self.rows.len() {
             return;
@@ -618,6 +661,7 @@ impl Editor {
         self.dirty += 1;
     }
 
+    /// delete a char at the current position
     fn delete_char(&mut self) {
         if self.position.cy == self.rows.len() || (self.position.cx == 0 && self.position.cy == 0) {
             return;
@@ -637,6 +681,10 @@ impl Editor {
         self.dirty += 1;
     }
 
+    /// Move the cursor in the direction of the `Arrow`
+    ///
+    /// Supports wrapping, for example a right at the end of
+    /// a line moves the cursor to the next line
     fn move_cursor(&mut self, key: Arrow) {
         match key {
             Arrow::Left => {
@@ -677,11 +725,18 @@ impl Editor {
         }
     }
 
+    /// Set that status message that will be drawn in the second to
+    /// the last row of the screen
     fn set_status_message(&mut self, msg: String) {
         self.status_msg = msg;
         self.status_time = get_time();
     }
 
+    /// Change thie visible portion of the file
+    ///
+    /// After processing any movement cursor commands, a call to scroll adjusts the
+    /// `rowoff`/`coloff` fields to change if we had moved ahead or behind of what
+    /// portion of the file is currently visible.
     fn scroll(&mut self) {
         self.rx = if self.position.cy < self.rows.len() {
             let row = &self.rows[self.position.cy];
@@ -707,6 +762,10 @@ impl Editor {
         }
     }
 
+    /// Read a single `Keypress` from stdin and perform the appropriate action
+    ///
+    /// # Return value
+    /// true if the keypress indicated the program should terminate
     fn process_keypress(&mut self) -> bool {
         let handle = &mut io::stdin();
         let kp = Self::editor_read_key(handle);
@@ -715,7 +774,8 @@ impl Editor {
             Keypress::Quit => {
                 if self.dirty > 0 && self.quit_times > 0 {
                     let quits_left = self.quit_times;
-                    let msg = format!("WARNING!!! File has unsaved changes. Press Ctrl-Q {} more times to quit.",
+                    let msg = format!("WARNING!!! File has unsaved changes. Press Ctrl-Q {} more \
+                                       times to quit.",
                                       quits_left);
                     self.set_status_message(msg);
                     self.quit_times -= 1;
@@ -769,6 +829,7 @@ impl Editor {
         true
     }
 
+    /// Redraw the entire screen
     fn refresh_screen(&mut self) -> io::Result<()> {
         self.scroll();
         let mut v = Vec::new();
@@ -783,6 +844,7 @@ impl Editor {
         execute(&v)
     }
 
+    /// Return text that should be displayed in the status bar
     fn draw_status_bar(&self) -> Vec<u8> {
         let display_name = if self.filename.is_empty() {
             "[No name]"
@@ -801,6 +863,7 @@ impl Editor {
                               self.rows.len());
         let truncated = &lstatus[0..min(lstatus.len(), (self.screencols - rstatus.len()))];
         v.extend(truncated.as_bytes());
+        // achieve right alignment by padding with whitespace
         v.extend(std::iter::repeat(b' ').take(self.screencols - truncated.len() - rstatus.len()));
         v.extend(rstatus.as_bytes());
         v.extend(NORMAL_COLOR);
@@ -808,15 +871,25 @@ impl Editor {
         v
     }
 
+    /// Return text that should be displayed in the message bar
+    ///
+    /// The message bar is for prompts or transient messages
     fn draw_message_bar(&mut self) -> Vec<u8> {
         let mut v: Vec<u8> = Vec::new();
         v.extend(CLEAR_LINE);
+
+        // after a status update is made, only draw it for 5 seconds
         if !self.status_msg.is_empty() && get_time().sub(self.status_time).num_seconds() < 5 {
             v.extend(self.status_msg.as_bytes());
         }
         v
     }
 
+    /// Return a single vector of all the row content that should be drawn
+    ///
+    /// Renders each of the lines in `rows` and applies the specified
+    /// color codes for syntax highlighting. If there is no file, lines
+    /// appear with `~`
     fn draw_rows(&self) -> Vec<u8> {
         let mut v = Vec::new();
         for y in 0..self.screenrows {
@@ -842,31 +915,22 @@ impl Editor {
 
                 let visible_line = line[start..start + len].as_bytes();
                 let highlights = &self.rows[filerow].highlights[start..start + len];
-                // let mut current_color: Option<Highlight> = None;
-                let mut current_color: i32 = -1;
+                let mut current_color = Highlight::color(Highlight::Normal);
+
+                // Add a code for the specified color if we aren't already using that color
                 for (&c, &hl) in visible_line.iter().zip(highlights) {
-                    match hl {
-                        Highlight::Normal => {
-                            if current_color != -1 {
-                                v.extend(b"\x1b[39m");
-                                current_color = -1;
-                            }
-                            v.push(c);
-                        }
-                        _ => {
-                            let color = Highlight::color(hl) as i32;
-                            if current_color != color {
-                                v.extend(format!("\x1b[{}m", color).as_bytes());
-                                current_color = color;
-                            }
-                            v.push(c)
-                        }
+                    let color = Highlight::color(hl);
+                    if current_color != color {
+                        v.extend(format!("\x1b[{}m", color).as_bytes());
+                        current_color = color;
                     }
+                    v.push(c)
                 }
-                if current_color != -1 {
+
+                // Set back to the normal color at the end of the line
+                if current_color != Highlight::color(Highlight::Normal) {
                     v.extend(b"\x1b[39m");
                 }
-                // v.extend(line[start..start + len].as_bytes());
                 v.extend(b"\r\n")
             }
         }
@@ -941,9 +1005,7 @@ impl Editor {
 }
 
 
-// ----------------------------------
 // Syntax highlighting implementation
-// ----------------------------------
 
 /// Provides methods for providing color codes for every character in a line
 impl<'a> Syntax<'a> {
@@ -952,8 +1014,7 @@ impl<'a> Syntax<'a> {
     /// # Return value
     /// The first syntax struct in HLDB with a matching extension, or NO_SYNTAX
     fn from(filename: &str) -> &'static Syntax<'static> {
-        filename
-            .rsplit('.')
+        filename.rsplit('.')
             .next()
             .and_then(|ext| {
                 HLDB.iter()
@@ -1094,8 +1155,7 @@ impl<'a> Syntax<'a> {
         // Check if any keyword in keywords is a prefix of the string
         // return Some(match) for the first match
         fn keyword_match<'a>(keywords: &'a [&'a str], remainder: &str) -> Option<&'a str> {
-            keywords
-                .iter()
+            keywords.iter()
                 .find(|&kw| &remainder[..min(remainder.len(), kw.len())] == *kw)
                 .map(|s| *s)
         }
@@ -1189,9 +1249,7 @@ impl<'a> Syntax<'a> {
 }
 
 
-// ------------------
 // terminal commands
-// -----------------
 
 /// Create the control sequence for moving the cursor to the specified x,y position
 fn to_pos(x: usize, y: usize) -> Vec<u8> {
@@ -1220,8 +1278,7 @@ fn get_cursor_position() -> io::Result<(u16, u16)> {
         return Err(io::Error::new(io::ErrorKind::Other, "invalid tty response"));
     }
     let dim_str = from_utf8(&vec[2..vec.len() - 1]).unwrap();
-    let v: Vec<u16> = dim_str
-        .split(';')
+    let v: Vec<u16> = dim_str.split(';')
         .flat_map(|s| s.parse::<u16>().into_iter())
         .collect();
     if v.len() != 2 {
@@ -1232,7 +1289,6 @@ fn get_cursor_position() -> io::Result<(u16, u16)> {
 
 
 fn main() {
-    // log4rs::init_file("config/log4rs.yaml", Default::default()).unwrap();
     let rawterm = RawTerm::from(libc::STDIN_FILENO).unwrap();
     let mut editor = Editor::from(rawterm).unwrap();
     args()
