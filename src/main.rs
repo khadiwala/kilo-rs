@@ -13,6 +13,7 @@ use std::os::unix::io::RawFd;
 use std::io::{self, Read, Write, BufRead, BufReader};
 use std::cmp::{max, min};
 use std::str::from_utf8;
+use std::mem;
 
 use libc::c_ushort;
 use time::{get_time, Timespec};
@@ -124,7 +125,7 @@ impl Highlight {
             Highlight::Comment => 36, // cyan
             Highlight::Keyword1 => 33, //yellow
             Highlight::Keyword2 => 32, //green
-            _ => 37,
+            Highlight::Normal => 37,
         }
     }
 }
@@ -428,29 +429,49 @@ impl PromptCallback for EmptyCallback {
 ///
 /// Moves the cursor to the position of the first match as the user types, moving to other matches with the arrow key.
 struct FindPromptCallback {
-    direction: i32,
-    last_match: i32, //indicates row of last match, -1 when there's no match
+    direction: Direction,
+    last_match: Option<LastMatch>,
+}
+
+#[derive(PartialEq, Eq, Clone, Copy)]
+enum Direction {
+    Forward,
+    Backward,
+}
+impl Direction {
+    fn from(a: Arrow) -> Direction {
+        match a {
+            Arrow::Right | Arrow::Down => Direction::Forward,
+            Arrow::Left | Arrow::Up => Direction::Backward,
+        }
+    }
+}
+
+struct LastMatch {
+    row_index: usize,
+
+    // what the highlight was before
     saved_hl: Vec<Highlight>,
+}
+impl LastMatch {
+    /// take the saved highlight, replacing `self.saved_hl` with an empty vec
+    fn take_saved(&mut self) -> Vec<Highlight> {
+        mem::replace(&mut self.saved_hl, Vec::new())
+    }
 }
 
 impl PromptCallback for FindPromptCallback {
     fn callback(&mut self, editor: &mut Editor, partial_input: &str, kp: Keypress) {
-        if !self.saved_hl.is_empty() {
-            // empty saved_hl into a new vector
-            let mut v = Vec::new();
-            v.append(&mut self.saved_hl);
-            editor.rows[self.last_match as usize].highlights = v;
-        }
+        self.last_match
+            .as_mut()
+            .map(|lm| { editor.rows[lm.row_index].highlights = lm.take_saved(); });
 
         match kp {
             Keypress::Enter | Keypress::Esc => return,
-            Keypress::Ar(Arrow::Right) |
-            Keypress::Ar(Arrow::Down) => self.direction = 1,
-            Keypress::Ar(Arrow::Left) |
-            Keypress::Ar(Arrow::Up) => self.direction = -1,
+            Keypress::Ar(dir) => self.direction = Direction::from(dir),
             _ => {
-                self.direction = 1;
-                self.last_match = -1;
+                self.direction = Direction::Forward;
+                self.last_match = None;
             }
         }
         Some(partial_input)
@@ -458,32 +479,60 @@ impl PromptCallback for FindPromptCallback {
             .find(|q| !q.is_empty())
             .and_then(|q| {
                 // there's a non-empty search query
-                if self.last_match == -1 {
-                    self.direction = 1
-                };
-                let mut current = self.last_match;
 
-                // always make one loop through the file
-                for _ in 0..editor.rows.len() {
-                    current += self.direction;
-                    // loop around when hitting end or beginning
-                    if current == -1 {
-                        current = (editor.rows.len() as i32) - 1;
-                    } else if current == editor.rows.len() as i32 {
-                        current = 0;
+                // always start forward
+                if self.last_match.is_none() {
+                    self.direction = Direction::Forward
+                };
+
+                // start with the line after the current match
+                // relative to the beginning if forward, end if back
+                let current = self.last_match
+                    .as_ref()
+                    .map(|lm| match self.direction {
+                             Direction::Forward => lm.row_index + 1,
+                             Direction::Backward => {
+                                 (((editor.rows.len() - 1) as i32) - (lm.row_index as i32 - 1)) as
+                                 usize
+                             }
+                         })
+                    .unwrap_or(0);
+
+                // make a pass through the file starting at the current match offset,
+                // looping back around through the file when reaching either end
+                // TODO how to extract this?!
+                match self.direction {
+                    Direction::Forward => {
+                        editor
+                            .rows
+                            .iter()
+                            .enumerate()
+                            .cycle()
+                            .skip(current as usize)
+                            .take(editor.rows.len())
+                            .flat_map(|(i, row)| row.rendered.find(q).map(|f| (i, f)).into_iter())
+                            .next()
                     }
-                    let row = &editor.rows[current as usize];
-                    let matched = row.rendered.find(q).map(|f| (current as usize, f));
-                    if matched.is_some() {
-                        return matched;
+                    Direction::Backward => {
+                        editor
+                            .rows
+                            .iter()
+                            .enumerate()
+                            .rev()
+                            .cycle()
+                            .skip(current)
+                            .take(editor.rows.len())
+                            .flat_map(|(i, row)| row.rendered.find(q).map(|f| (i, f)).into_iter())
+                            .next()
                     }
                 }
-                None
             })
             .map(|(rowidx, colidx)| {
                 // Found a match, update cursor position, highlight
-                self.last_match = rowidx as i32;
-                self.saved_hl = editor.rows[rowidx].highlights.clone();
+                self.last_match = Some(LastMatch {
+                                           row_index: rowidx,
+                                           saved_hl: editor.rows[rowidx].highlights.clone(),
+                                       });
                 editor.position.rowoff = editor.rows.len();
                 editor.position.cy = rowidx;
                 let brow = &mut editor.rows[rowidx];
@@ -568,10 +617,9 @@ impl Editor {
         let initial = self.position;
         let last = self.prompt("Seach: {} (Use ESC/Arrows/Enter)",
                                &mut FindPromptCallback {
-                                   direction: 1,
-                                   last_match: -1,
-                                   saved_hl: Vec::new(),
-                               });
+                                        direction: Direction::Forward,
+                                        last_match: None,
+                                    });
         last.ok()
             .iter()
             .find(|s| !s.is_empty())
