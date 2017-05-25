@@ -221,10 +221,10 @@ fn ioctl_window_size() -> io::Result<(u16, u16)> {
             _ => Err(io::Error::last_os_error()),
         }
         .and_then(|(row, col)| if col == 0 {
-            Err(io::Error::new(io::ErrorKind::Other, "ioctl error"))
-        } else {
-            Ok((row, col))
-        })
+                      Err(io::Error::new(io::ErrorKind::Other, "ioctl error"))
+                  } else {
+                      Ok((row, col))
+                  })
 }
 
 /// Get window size using vt100 codes
@@ -406,38 +406,12 @@ struct Editor {
     status_time: Timespec,
 }
 
-/// A callback that can be called live as the user interacts with the prompt
-///
-/// Used with the `Editor.prompt` method
-trait PromptCallback {
-    /// A function that is called on every keypress in the prompt
-    ///
-    /// # Arguments
-    /// * `editor` - Editor instance since `Editor::prompt` will have a borrow on `editor`
-    /// * `partial_input` - The current input the user has entered
-    /// * `keypress` - The last keypress (A character or control sequence)
-    fn callback(&mut self, editor: &mut Editor, partial_input: &str, keypress: Keypress);
-}
-
-/// A `PromptCallback` that does nothing
-struct EmptyCallback();
-impl PromptCallback for EmptyCallback {
-    fn callback(&mut self, _: &mut Editor, _: &str, _: Keypress) {}
-}
-
-/// A `PromptCallback` that searches for the user's query.
-///
-/// Moves the cursor to the position of the first match as the user types, moving to other matches with the arrow key.
-struct FindPromptCallback {
-    direction: Direction,
-    last_match: Option<LastMatch>,
-}
-
 #[derive(PartialEq, Eq, Clone, Copy)]
 enum Direction {
     Forward,
     Backward,
 }
+
 impl Direction {
     fn from(a: Arrow) -> Direction {
         match a {
@@ -445,8 +419,21 @@ impl Direction {
             Arrow::Left | Arrow::Up => Direction::Backward,
         }
     }
+
+    /// traverse the iterator backwords or forwards based on the direction
+    /// There is surely a way to return an iterator without just making a new vector,
+    /// but I can't figure it out
+    fn traverse<'a, T, I>(self, it: I) -> Vec<T>
+        where I: ExactSizeIterator<Item = T> + DoubleEndedIterator<Item = T>
+    {
+        match self {
+            Direction::Forward => it.collect(),
+            Direction::Backward => it.rev().collect(),
+        }
+    }
 }
 
+/// The location of the previous match when searching
 struct LastMatch {
     row_index: usize,
 
@@ -460,107 +447,25 @@ impl LastMatch {
     }
 }
 
-impl PromptCallback for FindPromptCallback {
-    fn callback(&mut self, editor: &mut Editor, partial_input: &str, kp: Keypress) {
-        self.last_match
-            .as_mut()
-            .map(|lm| { editor.rows[lm.row_index].highlights = lm.take_saved(); });
-
-        match kp {
-            Keypress::Enter | Keypress::Esc => return,
-            Keypress::Ar(dir) => self.direction = Direction::from(dir),
-            _ => {
-                self.direction = Direction::Forward;
-                self.last_match = None;
-            }
-        }
-        Some(partial_input)
-            .iter()
-            .find(|q| !q.is_empty())
-            .and_then(|q| {
-                // there's a non-empty search query
-
-                // always start forward
-                if self.last_match.is_none() {
-                    self.direction = Direction::Forward
-                };
-
-                // start with the line after the current match
-                // relative to the beginning if forward, end if back
-                let current = self.last_match
-                    .as_ref()
-                    .map(|lm| match self.direction {
-                             Direction::Forward => lm.row_index + 1,
-                             Direction::Backward => {
-                                 (((editor.rows.len() - 1) as i32) - (lm.row_index as i32 - 1)) as
-                                 usize
-                             }
-                         })
-                    .unwrap_or(0);
-
-                // make a pass through the file starting at the current match offset,
-                // looping back around through the file when reaching either end
-                // TODO how to extract this?!
-                match self.direction {
-                    Direction::Forward => {
-                        editor
-                            .rows
-                            .iter()
-                            .enumerate()
-                            .cycle()
-                            .skip(current as usize)
-                            .take(editor.rows.len())
-                            .flat_map(|(i, row)| row.rendered.find(q).map(|f| (i, f)).into_iter())
-                            .next()
-                    }
-                    Direction::Backward => {
-                        editor
-                            .rows
-                            .iter()
-                            .enumerate()
-                            .rev()
-                            .cycle()
-                            .skip(current)
-                            .take(editor.rows.len())
-                            .flat_map(|(i, row)| row.rendered.find(q).map(|f| (i, f)).into_iter())
-                            .next()
-                    }
-                }
-            })
-            .map(|(rowidx, colidx)| {
-                // Found a match, update cursor position, highlight
-                self.last_match = Some(LastMatch {
-                                           row_index: rowidx,
-                                           saved_hl: editor.rows[rowidx].highlights.clone(),
-                                       });
-                editor.position.rowoff = editor.rows.len();
-                editor.position.cy = rowidx;
-                let brow = &mut editor.rows[rowidx];
-                editor.position.cx = brow.rx_to_cx(colidx);
-                brow.highlight_range(Highlight::Match, colidx, colidx + partial_input.len());
-            });
-    }
-}
-
 impl Editor {
     /// Create a Editor struct from a Rawterm struct
     fn from(rt: RawTerm) -> io::Result<Editor> {
         let (rows, cols) = get_window_size()?;
         Ok(Editor {
-            _term: rt,
-            // leave two rows for status
-            screenrows: (rows - 2) as usize,
-            screencols: cols as usize,
-            position: Default::default(),
-            rx: 0,
-            rows: Vec::new(),
-            filename: String::new(),
-            dirty: 0,
-            quit_times: QUIT_TIMES,
-            status_msg: "".to_owned(),
-            status_time: Timespec::new(0, 0),
-            syntax: NO_SYNTAX,
-        })
+               _term: rt,
+               // leave two rows for status
+               screenrows: (rows - 2) as usize,
+               screencols: cols as usize,
+               position: Default::default(),
+               rx: 0,
+               rows: Vec::new(),
+               filename: String::new(),
+               dirty: 0,
+               quit_times: QUIT_TIMES,
+               status_msg: "".to_owned(),
+               status_time: Timespec::new(0, 0),
+               syntax: NO_SYNTAX,
+           })
     }
 
     /// Open a file and load all lines into the editor
@@ -594,7 +499,7 @@ impl Editor {
     /// The number of bytes saved to `self.filename`, if the save was successful.
     fn save(&mut self) -> io::Result<usize> {
         if self.filename == "" {
-            self.filename = self.prompt("Save as: {} (ESC to cancel)", &mut EmptyCallback())?;
+            self.filename = self.prompt("Save as: {} (ESC to cancel)", &mut |_, _, _| {})?;
             if self.filename == "" {
                 return Ok(0);
             } else {
@@ -613,13 +518,74 @@ impl Editor {
 
     /// Open a prompt and search for user's input.
     fn find(&mut self) {
+        let mut direction = Direction::Forward;
+        let mut last_match: Option<LastMatch> = None;
+        let mut on_keypress = |editor: &mut Editor, partial_input: &str, kp: Keypress| {
+            last_match
+                .as_mut()
+                .map(|lm| { editor.rows[lm.row_index].highlights = lm.take_saved(); });
+
+            match kp {
+                Keypress::Enter | Keypress::Esc => return,
+                Keypress::Ar(dir) => direction = Direction::from(dir),
+                _ => {
+                    direction = Direction::Forward;
+                    last_match = None;
+                }
+            }
+            Some(partial_input)
+                .iter()
+                .find(|q| !q.is_empty())
+                .and_then(|q| {
+                    // there's a non-empty search query
+
+                    // always start forward
+                    if last_match.is_none() {
+                        direction = Direction::Forward
+                    };
+
+                    // start with the line after the current match
+                    // relative to the beginning if forward, end if back
+                    let current = last_match
+                        .as_ref()
+                        .map(|lm| match direction {
+                                 Direction::Forward => lm.row_index + 1,
+                                 Direction::Backward => {
+                                     (((editor.rows.len() - 1) as i32) -
+                                      (lm.row_index as i32 - 1)) as
+                                     usize
+                                 }
+                             })
+                        .unwrap_or(0);
+
+                    // make a pass through the file starting at the current match offset,
+                    // looping back around through the file when reaching either end
+                    direction
+                        .traverse(editor.rows.iter().enumerate())
+                        .into_iter()
+                        .cycle()
+                        .skip(current)
+                        .take(editor.rows.len())
+                        .flat_map(|(i, row)| row.rendered.find(q).map(|f| (i, f)).into_iter())
+                        .next()
+                })
+                .map(|(rowidx, colidx)| {
+                    // Found a match, update cursor position, highlight
+                    last_match = Some(LastMatch {
+                                          row_index: rowidx,
+                                          saved_hl: editor.rows[rowidx].highlights.clone(),
+                                      });
+                    editor.position.rowoff = editor.rows.len();
+                    editor.position.cy = rowidx;
+                    let brow = &mut editor.rows[rowidx];
+                    editor.position.cx = brow.rx_to_cx(colidx);
+                    brow.highlight_range(Highlight::Match, colidx, colidx + partial_input.len());
+                });
+        };
         // Save the position from before the start of the search
         let initial = self.position;
-        let last = self.prompt("Seach: {} (Use ESC/Arrows/Enter)",
-                               &mut FindPromptCallback {
-                                        direction: Direction::Forward,
-                                        last_match: None,
-                                    });
+
+        let last = self.prompt("Seach: {} (Use ESC/Arrows/Enter)", &mut on_keypress);
         last.ok()
             .iter()
             .find(|s| !s.is_empty())
@@ -629,7 +595,8 @@ impl Editor {
             .unwrap_or_else(|| self.position = initial);
     }
 
-    /// Display the prompt to the user and trigger the `PromptCallback` on every keypress
+
+    /// Display the prompt to the user and trigger the `callback` on every keypress
     ///
     /// Switches focus to the status bar. A Enter or Esc keypress ends the prompt interaction.
     ///
@@ -643,8 +610,8 @@ impl Editor {
     /// # Return value
     /// The state of the user's input when Enter was pressed, or empty string if the prompt was
     /// cancelled via Esc
-    fn prompt<T>(&mut self, prompt: &str, callback: &mut T) -> io::Result<String>
-        where T: PromptCallback
+    fn prompt<F>(&mut self, prompt: &str, callback: &mut F) -> io::Result<String>
+        where F: FnMut(&mut Editor, &str, Keypress)
     {
         let handle = &mut io::stdin();
         let mut input = String::with_capacity(128);
@@ -663,13 +630,13 @@ impl Editor {
                 Keypress::Enter => {
                     if !input.is_empty() {
                         self.set_status_message("".to_string());
-                        callback.callback(self, &input, keypress);
+                        callback(self, &input, keypress);
                         return Ok(input);
                     }
                 }
                 Keypress::Esc => {
                     self.set_status_message("".to_string());
-                    callback.callback(self, &input, keypress);
+                    callback(self, &input, keypress);
                     return Ok(String::new());
                 }
                 Keypress::Chr(c) => {
@@ -677,7 +644,7 @@ impl Editor {
                 }
                 _ => (),
             }
-            callback.callback(self, &input, keypress);
+            callback(self, &input, keypress);
         }
     }
 
@@ -1062,7 +1029,8 @@ impl<'a> Syntax<'a> {
     /// # Return value
     /// The first syntax struct in HLDB with a matching extension, or NO_SYNTAX
     fn from(filename: &str) -> &'static Syntax<'static> {
-        filename.rsplit('.')
+        filename
+            .rsplit('.')
             .next()
             .and_then(|ext| {
                 HLDB.iter()
@@ -1203,7 +1171,8 @@ impl<'a> Syntax<'a> {
         // Check if any keyword in keywords is a prefix of the string
         // return Some(match) for the first match
         fn keyword_match<'a>(keywords: &'a [&'a str], remainder: &str) -> Option<&'a str> {
-            keywords.iter()
+            keywords
+                .iter()
                 .find(|&kw| &remainder[..min(remainder.len(), kw.len())] == *kw)
                 .map(|s| *s)
         }
@@ -1326,7 +1295,8 @@ fn get_cursor_position() -> io::Result<(u16, u16)> {
         return Err(io::Error::new(io::ErrorKind::Other, "invalid tty response"));
     }
     let dim_str = from_utf8(&vec[2..vec.len() - 1]).unwrap();
-    let v: Vec<u16> = dim_str.split(';')
+    let v: Vec<u16> = dim_str
+        .split(';')
         .flat_map(|s| s.parse::<u16>().into_iter())
         .collect();
     if v.len() != 2 {
