@@ -398,8 +398,8 @@ struct Editor {
     // the name of the file, empty if there isn't one
     filename: String,
     syntax: &'static Syntax<'static>,
-    // nonzeo if the file has been modified but not saved
-    dirty: usize,
+    // true if the file has been modified but not saved
+    dirty: bool,
     // number of times we've quit (relevant when we're trying to quit with a dirty file)
     quit_times: u8,
     status_msg: String,
@@ -460,7 +460,7 @@ impl Editor {
                rx: 0,
                rows: Vec::new(),
                filename: String::new(),
-               dirty: 0,
+               dirty: false,
                quit_times: QUIT_TIMES,
                status_msg: "".to_owned(),
                status_time: Timespec::new(0, 0),
@@ -512,7 +512,7 @@ impl Editor {
         handle?.write_all(file_content.as_bytes())?;
 
         // only clear dirty if save worked
-        self.dirty = 0;
+        self.dirty = false;
         Ok(len)
     }
 
@@ -655,7 +655,7 @@ impl Editor {
         }
         self.rows[self.position.cy].insert_char(self.position.cx, c);
         self.position.cx += 1;
-        self.dirty += 1;
+        self.dirty = true;
     }
 
     /// insert a newline at the current position, which might split
@@ -673,7 +673,7 @@ impl Editor {
         }
         self.position.cx = 0;
         self.position.cy += 1;
-        self.dirty += 1;
+        self.dirty = true;
     }
 
     /// delete a char at the current position
@@ -693,7 +693,7 @@ impl Editor {
             self.position.cy -= 1;
 
         }
-        self.dirty += 1;
+        self.dirty = true;
     }
 
     /// Move the cursor in the direction of the `Arrow`
@@ -787,7 +787,7 @@ impl Editor {
         match kp {
             // editor commands
             Keypress::Quit => {
-                if self.dirty > 0 && self.quit_times > 0 {
+                if self.dirty && self.quit_times > 0 {
                     let quits_left = self.quit_times;
                     let msg = format!("WARNING!!! File has unsaved changes. Press Ctrl-Q {} more \
                                        times to quit.",
@@ -871,7 +871,7 @@ impl Editor {
         let lstatus = format!("{} - {} lines {}",
                               &display_name[..min(display_name.len(), 20)],
                               self.rows.len(),
-                              if self.dirty != 0 { "(modified)" } else { "" });
+                              if self.dirty { "(modified)" } else { "" });
         let rstatus = format!("{} | {}/{}",
                               self.syntax.filetype,
                               self.position.cy + 1,
