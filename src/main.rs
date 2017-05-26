@@ -252,11 +252,29 @@ fn get_window_size() -> io::Result<(u16, u16)> {
 ///
 /// Contains both the source text and a rendering. Rerenders text on modifications.
 struct Row {
-    orig: String,
+    source: String,
     rendered: String,
     highlights: Vec<Highlight>,
     syntax: &'static Syntax<'static>,
     len: usize,
+}
+
+/// Make updates to the base text of a row and
+/// update derrived structures on drop
+struct RowUpdater<'a>(&'a mut Row);
+
+impl<'a> RowUpdater<'a> {
+    fn from(row: &mut Row) -> RowUpdater {
+        RowUpdater(row)
+    }
+}
+impl<'a> Drop for RowUpdater<'a> {
+    /// Update derrived structures after modifications to `self.source`
+    fn drop(&mut self) {
+        self.0.rendered = Row::render(&self.0.source);
+        self.0.highlights = self.0.syntax.highlight(&self.0.rendered);
+        self.0.len = self.0.source.len();
+    }
 }
 
 impl Row {
@@ -269,8 +287,8 @@ impl Row {
         let highlights = syntax.highlight(&rendered);
         let len = line.len();
         Row {
+            source: line,
             rendered: rendered,
-            orig: line,
             highlights: highlights,
             len: len,
             syntax: syntax,
@@ -279,26 +297,23 @@ impl Row {
 
     /// insert a character `c` at `at` and rerender the text
     fn insert_char(&mut self, at: usize, c: char) {
-        self.orig.insert(min(at, self.len), c);
-        self.update();
+        let len = self.len;
+        RowUpdater::from(self).0.source.insert(min(at, len), c);
     }
 
     /// delete character at `at` and rerender the text
     fn delete_char(&mut self, at: usize) {
-        self.orig.remove(at);
-        self.update();
+        RowUpdater::from(self).0.source.remove(at);
     }
 
     /// Append a row `r` to this row
     fn push(&mut self, r: &Row) {
-        self.orig.push_str(&r.orig);
-        self.update();
+        RowUpdater::from(self).0.source.push_str(&r.source);
     }
 
     /// Split this at `at`, returning ownership of the new `Row` to caller.
     fn split_off(&mut self, at: usize) -> Row {
-        let right = self.orig.split_off(at);
-        self.update();
+        let right = RowUpdater::from(self).0.source.split_off(at);
         Row::from(right, self.syntax)
     }
 
@@ -309,17 +324,9 @@ impl Row {
         }
     }
 
-    /// Update derrived structures after modifications to `self.orig`
-    fn update(&mut self) {
-        self.rendered = Row::render(&self.orig);
-        self.highlights = self.syntax.highlight(&self.rendered);
-        self.len = self.orig.len();
-    }
-
-
     /// Translate a position in the original text to a position in the rendered text.
     fn cx_to_rx(&self, cx: usize) -> usize {
-        let row = self.orig.as_bytes();
+        let row = self.source.as_bytes();
         let mut rx = 0;
         for &c in row[0..cx].iter() {
             if c == b'\t' {
@@ -332,7 +339,7 @@ impl Row {
 
     /// Translate a position in the rendered text to a position in the original text.
     fn rx_to_cx(&self, rx: usize) -> usize {
-        let row = self.orig.as_bytes();
+        let row = self.source.as_bytes();
         let mut cur_rx = 0;
         for (i, &c) in row.iter().enumerate() {
             if c == b'\t' {
@@ -370,6 +377,7 @@ impl Row {
         std::string::String::from_utf8(rendered).unwrap()
     }
 }
+
 
 /// A position in the editor.
 ///
@@ -423,7 +431,7 @@ impl Direction {
     /// traverse the iterator backwords or forwards based on the direction
     /// There is surely a way to return an iterator without just making a new vector,
     /// but I can't figure it out
-    fn traverse<'a, T, I>(self, it: I) -> Vec<T>
+    fn traverse<T, I>(self, it: I) -> Vec<T>
         where I: ExactSizeIterator<Item = T> + DoubleEndedIterator<Item = T>
     {
         match self {
@@ -474,10 +482,10 @@ impl Editor {
         self.syntax = Syntax::from(filename);
         let f = File::open(filename)?;
         let handle = BufReader::new(f);
-        for rline in handle.lines() {
-            let line = rline?;
-            self.rows.push(Row::from(line, self.syntax));
-        }
+        self.rows = handle
+            .lines()
+            .map(|s| Ok(Row::from(s?, self.syntax)))
+            .collect::<io::Result<Vec<Row>>>()?;
         Ok(())
     }
 
@@ -485,7 +493,7 @@ impl Editor {
     fn rows_to_file(&self) -> String {
         self.rows
             .iter()
-            .map(|row| &row.orig)
+            .map(|row| &row.source)
             .fold(String::new(), |mut s, nxt| {
                 s.push_str(nxt);
                 s.push('\n');
